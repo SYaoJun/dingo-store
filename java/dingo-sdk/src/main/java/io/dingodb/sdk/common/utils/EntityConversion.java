@@ -73,12 +73,14 @@ import io.dingodb.store.Store;
 
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static io.dingodb.common.Common.IndexType.INDEX_TYPE_SCALAR;
 import static io.dingodb.common.Common.IndexType.INDEX_TYPE_VECTOR;
 import static io.dingodb.sdk.common.utils.NoBreakFunctions.wrap;
 import static io.dingodb.sdk.common.utils.Parameters.cleanNull;
@@ -107,6 +109,7 @@ public class EntityConversion {
                 .setReplica(table.getReplica())
                 .addAllColumns(columnDefinitions)
                 .setAutoIncrement(table.getAutoIncrement())
+                .putAllProperties(table.getProperties() == null ? new HashMap() : table.getProperties())
                 .setCreateSql(Parameters.cleanNull(table.getCreateSql(), ""))
                 .setIndexParameter(Optional.mapOrGet(table.getIndexParameter(), EntityConversion::mapping, () -> Common.IndexParameter.newBuilder().build()))
                 .build();
@@ -134,7 +137,7 @@ public class EntityConversion {
 
     public static Partition mapping(long id, Meta.TableDefinition tableDefinition, List<Column> columns) {
         Meta.PartitionRule partition = tableDefinition.getTablePartition();
-        if (partition.getPartitionsCount() <= 1) {
+        if (partition.getPartitionsCount() < 1) {
             return null;
         }
         DingoKeyValueCodec codec = DingoKeyValueCodec.of(id, columns);
@@ -148,8 +151,8 @@ public class EntityConversion {
                 .map(wrap(codec::decodeKeyPrefix))
                 .map(key -> new PartitionDetailDefinition(null, null, key))
                 .collect(Collectors.toList());
-        // The current version only supports the range strategy.
-        return new PartitionRule("RANGE", partition.getColumnsList(), details);
+
+        return new PartitionRule(getStrategy(partition.getStrategy()), partition.getColumnsList(), details);
     }
 
     public static Column mapping(Meta.ColumnDefinition definition) {
@@ -290,7 +293,7 @@ public class EntityConversion {
     }
 
     public static PartitionRule mapping(long id, Meta.PartitionRule partition) {
-        if (partition.getPartitionsCount() <= 1) {
+        if (partition.getPartitionsCount() < 1) {
             return null;
         }
         SCHEMA.setIsKey(true);
@@ -306,7 +309,27 @@ public class EntityConversion {
                 .map(key -> new PartitionDetailDefinition("", "", key))
                 .collect(Collectors.toList());
 
-        return new PartitionRule("RANGE", partition.getColumnsList(), details);
+        return new PartitionRule(getStrategy(partition.getStrategy()), partition.getColumnsList(), details);
+    }
+
+    private static String getStrategy(Meta.PartitionStrategy partitionStrategy) {
+        String strategy;
+        if (partitionStrategy == Meta.PartitionStrategy.PT_STRATEGY_HASH) {
+            strategy = "HASH";
+        } else {
+            strategy = "RANGE";
+        }
+        return strategy;
+    }
+
+    private static void getStrategy(Partition partition, Meta.PartitionRule.Builder builder) {
+        if (partition != null && partition.getFuncName() != null) {
+            if (partition.getFuncName().equalsIgnoreCase("HASH")) {
+                builder.setStrategy(Meta.PartitionStrategy.PT_STRATEGY_HASH);
+            } else {
+                builder.setStrategy(Meta.PartitionStrategy.PT_STRATEGY_RANGE);
+            }
+        }
     }
 
     public static Meta.IndexDefinition mapping(long id, Index index, List<Meta.DingoCommonId> partitionIds) {
@@ -329,6 +352,7 @@ public class EntityConversion {
                     .build());
             start = keys.hasNext() ? keys.next() : start;
         }
+        getStrategy(index.getIndexPartition(), builder);
 
         return Meta.IndexDefinition.newBuilder()
                 .setName(index.getName())
@@ -396,7 +420,8 @@ public class EntityConversion {
                 default:
                     throw new IllegalStateException("Unexpected value: " + vectorParam.getVectorIndexType());
             }
-        } else {
+        }
+        if (parameter.getIndexType() == INDEX_TYPE_SCALAR) {
             // Scalar parameter
             Common.ScalarIndexParameter scalarParam = parameter.getScalarIndexParameter();
             return new IndexParameter(IndexParameter.IndexType.valueOf(parameter.getIndexType().name()),
@@ -405,6 +430,7 @@ public class EntityConversion {
                             scalarParam.getIsUnique()));
 
         }
+        return null;
     }
 
     public static Common.IndexParameter mapping(IndexParameter parameter) {
@@ -472,16 +498,7 @@ public class EntityConversion {
                 .setId(withId.getId());
         if (withId.getVector() != null) {
             Vector vector = withId.getVector();
-            builder
-                .setVector(Common.Vector.newBuilder()
-                        .setDimension(vector.getDimension())
-                        .setValueType(Common.ValueType.valueOf(vector.getValueType().name()))
-                        .addAllFloatValues(vector.getFloatValues())
-                        .addAllBinaryValues(vector.getBinaryValues()
-                                .stream()
-                                .map(ByteString::copyFrom)
-                                .collect(Collectors.toList()))
-                        .build());
+            builder.setVector(mapping(vector));
         }
         if (withId.getScalarData() != null) {
             builder.setScalarData(mapping(withId.getScalarData()));
@@ -496,6 +513,26 @@ public class EntityConversion {
         return builder.build();
     }
 
+    public static Common.Vector mapping(Vector vector) {
+        return Common.Vector.newBuilder()
+                .setDimension(vector.getDimension())
+                .setValueType(Common.ValueType.valueOf(vector.getValueType().name()))
+                .addAllFloatValues(vector.getFloatValues())
+                .addAllBinaryValues(vector.getBinaryValues()
+                        .stream()
+                        .map(ByteString::copyFrom)
+                        .collect(Collectors.toList()))
+                .build();
+    }
+
+    public static Vector mapping(Common.Vector vector) {
+        return new Vector(
+            vector.getDimension(),
+            Vector.ValueType.valueOf(vector.getValueType().name()),
+            vector.getFloatValuesList(),
+            vector.getBinaryValuesList().stream().map(ByteString::toByteArray).collect(Collectors.toList()));
+    }
+
     public static Common.VectorScalardata mapping(Map<String, ScalarValue> scalarData) {
         return Common.VectorScalardata.newBuilder().putAllScalarData(scalarData.entrySet().stream()
                     .collect(
@@ -507,11 +544,7 @@ public class EntityConversion {
 
     public static VectorWithId mapping(Common.VectorWithId withId) {
         Common.Vector vector = withId.getVector();
-        return new VectorWithId(withId.getId(), new Vector(
-                vector.getDimension(),
-                Vector.ValueType.valueOf(vector.getValueType().name()),
-                vector.getFloatValuesList(),
-                vector.getBinaryValuesList().stream().map(ByteString::toByteArray).collect(Collectors.toList())),
+        return new VectorWithId(withId.getId(), mapping(vector),
                 withId.getScalarData().getScalarDataMap().entrySet().stream().collect(
                         Maps::newHashMap,
                         (map, entry) -> map.put(entry.getKey(), mapping(entry.getValue())),
@@ -612,6 +645,76 @@ public class EntityConversion {
                 VectorIndexParameter.MetricType.valueOf(distance.getMetricType().name()));
     }
 
+    public static Common.VectorCoprocessor mapping(Coprocessor coprocessor, long partId) {
+        Common.VectorCoprocessor.VectorSchemaWrapper schemaWrapper = Common.VectorCoprocessor.VectorSchemaWrapper.newBuilder()
+                .addAllSchema(mapping(coprocessor.getOriginalSchema()))
+                .setCommonId(partId)
+                .build();
+        return Common.VectorCoprocessor.newBuilder()
+                .setSchemaVersion(coprocessor.getSchemaVersion())
+                .setOriginalSchema(schemaWrapper)
+                .addAllSelectionColumns(Parameters.cleanNull(coprocessor.getSelection(), Collections.emptyList()))
+                .setExpression(ByteString.copyFrom(Parameters.cleanNull(coprocessor.getExpression(), ByteArrayUtils.EMPTY_BYTES)))
+                .build();
+    }
+
+    public static List<Common.VectorSchema> mapping(Coprocessor.SchemaWrapper schemaWrapper) {
+        if (schemaWrapper == null) {
+            return Collections.emptyList();
+        }
+        return CodecUtils.createSchemaForColumns(schemaWrapper.getSchemas()).stream()
+                .map(schema -> {
+                    Common.VectorSchema.Type vs;
+                    switch (schema.getType()) {
+                        case BOOLEAN:
+                            vs = Common.VectorSchema.Type.BOOL;
+                            break;
+                        case INTEGER:
+                            vs = Common.VectorSchema.Type.INTEGER;
+                            break;
+                        case FLOAT:
+                            vs = Common.VectorSchema.Type.FLOAT;
+                            break;
+                        case LONG:
+                            vs = Common.VectorSchema.Type.LONG;
+                            break;
+                        case DOUBLE:
+                            vs = Common.VectorSchema.Type.DOUBLE;
+                            break;
+                        case BYTES:
+                        case STRING:
+                            vs = Common.VectorSchema.Type.STRING;
+                            break;
+                        case BOOLEANLIST:
+                            vs = Common.VectorSchema.Type.BOOLLIST;
+                            break;
+                        case INTEGERLIST:
+                            vs = Common.VectorSchema.Type.INTEGERLIST;
+                            break;
+                        case FLOATLIST:
+                            vs = Common.VectorSchema.Type.FLOATLIST;
+                            break;
+                        case LONGLIST:
+                            vs = Common.VectorSchema.Type.LONGLIST;
+                            break;
+                        case DOUBLELIST:
+                            vs = Common.VectorSchema.Type.DOUBLELIST;
+                            break;
+                        case STRINGLIST:
+                            vs = Common.VectorSchema.Type.STRINGLIST;
+                            break;
+                        default:
+                            throw new IllegalStateException("Unexpected value: " + schema.getType());
+                    }
+                    return Common.VectorSchema.newBuilder()
+                            .setType(vs)
+                            .setIsKey(schema.isKey())
+                            .setIsNullable(schema.isAllowNull())
+                            .setIndex(schema.getIndex())
+                            .build();
+                }).collect(Collectors.toList());
+    }
+
     public static Store.Coprocessor mapping(Coprocessor coprocessor, DingoCommonId regionId) {
         return Store.Coprocessor.newBuilder()
                 .setSchemaVersion(coprocessor.getSchemaVersion())
@@ -666,6 +769,18 @@ public class EntityConversion {
             case BYTES:
             case STRING:
                 return Store.Schema.Type.STRING;
+            case BOOLEANLIST:
+                return Store.Schema.Type.BOOLLIST;
+            case INTEGERLIST:
+                return Store.Schema.Type.INTEGERLIST;
+            case FLOATLIST:
+                return Store.Schema.Type.FLOATLIST;
+            case LONGLIST:
+                return Store.Schema.Type.LONGLIST;
+            case DOUBLELIST:
+                return Store.Schema.Type.DOUBLELIST;
+            case STRINGLIST:
+                return Store.Schema.Type.STRINGLIST;
             default:
                 throw new IllegalStateException("Unexpected value: " + type);
         }
@@ -699,7 +814,7 @@ public class EntityConversion {
                     .build());
             start = keys.hasNext() ? keys.next() : start;
         }
-
+        getStrategy(table.getPartition(), builder);
         return builder.build();
     }
 

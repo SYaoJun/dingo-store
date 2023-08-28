@@ -19,10 +19,9 @@
 #include "butil/status.h"
 #include "proto/common.pb.h"
 #include "proto/error.pb.h"
+#include "server/server.h"
 
 namespace dingodb {
-
-VectorIndex::~VectorIndex() = default;
 
 pb::common::VectorIndexType VectorIndex::VectorIndexType() const { return vector_index_type; }
 

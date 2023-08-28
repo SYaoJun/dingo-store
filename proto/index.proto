@@ -57,6 +57,11 @@ message VectorScanQueryRequest {
   uint64 vector_id_start = 2;
   bool is_reverse_scan = 3;
   uint64 max_scan_count = 4;  // the max count user want to scan
+  uint64 vector_id_end = 5;   // the end id of scan, if is_reverse_scan is true, vector_id_end must be less than
+                              // vector_id_start, if is_reverse_scan is false, vector_id_end must be greater than
+                              // vector_id_start
+                              // the real range is [start, end], include start and end
+                              // if vector_id_end == 0, scan to the end of the region
 
   bool without_vector_data = 11;       // Default false, if true, response without vector data.
   bool with_scalar_data = 12;          // Default false, if true, response with scalar data.
@@ -165,6 +170,30 @@ message VectorCalcDistanceResponse {
   repeated VectorDistance distances = 4;
 }
 
+// vector.id > 0: exact query
+// vector.id == 0: similarity search with vector.vector
+message VectorSearchDebugRequest {
+  uint64 region_id = 1;
+  dingodb.pb.common.VectorWithId vector = 2;
+  dingodb.pb.common.VectorSearchParameter parameter = 3;
+  repeated dingodb.pb.common.VectorWithId vector_with_ids = 4;  // this field is used for batch search
+}
+
+message VectorSearchDebugResponse {
+  dingodb.pb.error.Error error = 1;
+  repeated dingodb.pb.common.VectorWithDistance results = 2;
+  repeated VectorWithDistanceResult batch_results = 3;  // this field is used for batch search
+
+  // scalar scan time unit  microsecond 10 -6 s
+  int64 deserialization_id_time_us = 4;
+
+  // scalar scan time unit  microsecond 10 -6 s
+  int64 scan_scalar_time_us = 5;
+
+  // search  vector unit  microsecond 10 -6 s
+  int64 search_time_us = 6;
+}
+
 service IndexService {
   // vector index
   rpc VectorAdd(VectorAddRequest) returns (VectorAddResponse);
@@ -175,4 +204,8 @@ service IndexService {
   rpc VectorScanQuery(VectorScanQueryRequest) returns (VectorScanQueryResponse);
   rpc VectorGetRegionMetrics(VectorGetRegionMetricsRequest) returns (VectorGetRegionMetricsResponse);
   rpc VectorCalcDistance(VectorCalcDistanceRequest) returns (VectorCalcDistanceResponse);
+
+  // debug
+  // test  vector search performance
+  rpc VectorSearchDebug(VectorSearchDebugRequest) returns (VectorSearchDebugResponse);
 };

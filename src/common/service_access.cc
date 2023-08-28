@@ -81,8 +81,11 @@ butil::Status ServiceAccess::InstallVectorIndexSnapshot(const pb::node::InstallV
   }
 
   if (response.error().errcode() != pb::error::OK) {
-    DINGO_LOG(ERROR) << fmt::format("InstallVectorIndexSnapshot response failed, error {} {}",
-                                    static_cast<int>(response.error().errcode()), response.error().errmsg());
+    if (response.error().errcode() != pb::error::EVECTOR_NOT_NEED_SNAPSHOT &&
+        response.error().errcode() != pb::error::EVECTOR_SNAPSHOT_EXIST) {
+      DINGO_LOG(ERROR) << fmt::format("InstallVectorIndexSnapshot response failed, error {} {}",
+                                      static_cast<int>(response.error().errcode()), response.error().errmsg());
+    }
     return butil::Status(response.error().errcode(), response.error().errmsg());
   }
 
@@ -113,6 +116,32 @@ butil::Status ServiceAccess::GetVectorIndexSnapshot(const pb::node::GetVectorInd
       DINGO_LOG(ERROR) << fmt::format("GetVectorIndexSnapshot response failed, error {} {}",
                                       static_cast<int>(response.error().errcode()), response.error().errmsg());
     }
+    return butil::Status(response.error().errcode(), response.error().errmsg());
+  }
+
+  return butil::Status();
+}
+
+butil::Status ServiceAccess::CheckVectorIndex(const pb::node::CheckVectorIndexRequest& request,
+                                              const butil::EndPoint& endpoint,
+                                              pb::node::CheckVectorIndexResponse& response) {
+  brpc::Channel channel;
+  if (channel.Init(endpoint, nullptr) != 0) {
+    DINGO_LOG(ERROR) << "Fail to init channel to " << butil::endpoint2str(endpoint).c_str();
+    return {};
+  }
+
+  brpc::Controller cntl;
+  cntl.set_timeout_ms(3000);
+  pb::node::NodeService_Stub stub(&channel);
+
+  stub.CheckVectorIndex(&cntl, &request, &response, nullptr);
+  if (cntl.Failed()) {
+    DINGO_LOG(ERROR) << fmt::format("Send CheckVectorIndex request failed, error {}", cntl.ErrorText());
+    return butil::Status(pb::error::EINTERNAL, cntl.ErrorText());
+  }
+
+  if (response.error().errcode() != pb::error::OK) {
     return butil::Status(response.error().errcode(), response.error().errmsg());
   }
 
@@ -152,7 +181,7 @@ bool RemoteFileCopier::Init() {
 std::shared_ptr<pb::fileservice::GetFileResponse> RemoteFileCopier::GetFile(
     const pb::fileservice::GetFileRequest& request, butil::IOBuf* buf) {
   brpc::Controller cntl;
-  cntl.set_timeout_ms(1000L);
+  cntl.set_timeout_ms(3000L);
   pb::fileservice::FileService_Stub stub(&channel_);
 
   auto response = std::make_shared<pb::fileservice::GetFileResponse>();

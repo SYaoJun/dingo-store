@@ -33,6 +33,7 @@
 #include "meta/transform_kv_able.h"
 #include "proto/common.pb.h"
 #include "proto/store_internal.pb.h"
+#include "vector/vector_index.h"
 
 namespace dingodb {
 
@@ -41,7 +42,7 @@ namespace store {
 // Warp pb region for atomic/metux
 class Region {
  public:
-  Region() { bthread_mutex_init(&mutex_, nullptr); };
+  Region() : is_switching_vector_index_(false) { bthread_mutex_init(&mutex_, nullptr); };
   ~Region() { bthread_mutex_destroy(&mutex_); }
 
   Region(const Region&) = delete;
@@ -55,14 +56,22 @@ class Region {
 
   uint64_t Id() const { return inner_region_.id(); }
   const std::string& Name() const { return inner_region_.definition().name(); }
+  pb::common::RegionType Type() { return inner_region_.region_type(); }
 
   uint64_t LeaderId();
   void SetLeaderId(uint64_t leader_id);
 
   const pb::common::Range& Range();
-  const pb::common::Range& RawRange();
   void SetRange(const pb::common::Range& range);
+  const pb::common::Range& RawRange();
   void SetRawRange(const pb::common::Range& range);
+  // Get physics range, it's rocksdb data range.
+  // store region raw_range == physics ragne
+  // index region raw_range != physics ragne
+  std::vector<pb::common::Range> PhysicsRange();
+
+  std::string RangeToString();
+  bool CheckKeyInRange(const std::string& key);
 
   void SetIndexParameter(const pb::common::IndexParameter& index_parameter);
 
@@ -76,12 +85,25 @@ class Region {
   bool DisableSplit();
   void SetDisableSplit(bool disable_split);
 
+  std::shared_ptr<VectorIndex> ShareVectorIndex() { return share_vector_index_; }
+  void SetShareVectorIndex(std::shared_ptr<VectorIndex> vector_index) { share_vector_index_ = vector_index; }
+
+  uint64_t PartitionId();
+
   const pb::store_internal::Region& InnerRegion() const { return inner_region_; }
+
+  bool IsSwitchingVectorIndex() { return is_switching_vector_index_.load(); }
+  void SetIsSwitchingVectorIndex(bool is_switching) { is_switching_vector_index_.store(is_switching); }
 
  private:
   bthread_mutex_t mutex_;
   pb::store_internal::Region inner_region_;
   std::atomic<pb::common::StoreRegionState> state_;
+  // Share vector index with parent region, when spliting region.
+  std::shared_ptr<VectorIndex> share_vector_index_;
+
+  // Indicate switching vector index.
+  std::atomic<bool> is_switching_vector_index_;
 };
 
 using RegionPtr = std::shared_ptr<Region>;

@@ -37,7 +37,6 @@
 #include "proto/error.pb.h"
 #include "proto/index.pb.h"
 #include "proto/region_control.pb.h"
-#include "vector/vector_index_filter.h"
 #include "vector/vector_index_utils.h"
 
 namespace dingodb {
@@ -45,7 +44,6 @@ namespace dingodb {
 VectorIndexFlat::VectorIndexFlat(uint64_t id, const pb::common::VectorIndexParameter& vector_index_parameter)
     : VectorIndex(id, vector_index_parameter, 0) {
   bthread_mutex_init(&mutex_, nullptr);
-  is_online_.store(true);
 
   metric_type_ = vector_index_parameter.flat_parameter().metric_type();
   dimension_ = vector_index_parameter.flat_parameter().dimension();
@@ -65,11 +63,11 @@ VectorIndexFlat::VectorIndexFlat(uint64_t id, const pb::common::VectorIndexParam
     raw_index_ = std::make_unique<faiss::IndexFlatL2>(dimension_);
   }
 
-  index_ = std::make_unique<faiss::IndexIDMap2>(raw_index_.get());
+  index_id_map2_ = std::make_unique<faiss::IndexIDMap2>(raw_index_.get());
 }
 
 VectorIndexFlat::~VectorIndexFlat() {
-  index_->reset();
+  index_id_map2_->reset();
   bthread_mutex_destroy(&mutex_);
 }
 
@@ -87,13 +85,6 @@ VectorIndexFlat::~VectorIndexFlat() {
 
 butil::Status VectorIndexFlat::AddOrUpsert(const std::vector<pb::common::VectorWithId>& vector_with_ids,
                                            bool is_upsert) {
-  // check is_online
-  if (!is_online_.load()) {
-    std::string s = fmt::format("vector index is offline, please wait for online");
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(pb::error::Errno::EVECTOR_INDEX_OFFLINE, s);
-  }
-
   if (vector_with_ids.empty()) {
     return butil::Status::OK();
   }
@@ -124,7 +115,7 @@ butil::Status VectorIndexFlat::AddOrUpsert(const std::vector<pb::common::VectorW
 
   if (is_upsert) {
     faiss::IDSelectorArray sel(vector_with_ids.size(), ids.get());
-    index_->remove_ids(sel);
+    index_id_map2_->remove_ids(sel);
   }
 
   std::unique_ptr<float[]> vectors;
@@ -146,7 +137,7 @@ butil::Status VectorIndexFlat::AddOrUpsert(const std::vector<pb::common::VectorW
     }
   }
 
-  index_->add_with_ids(vector_with_ids.size(), vectors.get(), ids.get());
+  index_id_map2_->add_with_ids(vector_with_ids.size(), vectors.get(), ids.get());
 
   return butil::Status::OK();
 }
@@ -160,13 +151,6 @@ butil::Status VectorIndexFlat::Add(const std::vector<pb::common::VectorWithId>& 
 }
 
 butil::Status VectorIndexFlat::Delete(const std::vector<uint64_t>& delete_ids) {
-  // check is_online
-  if (!is_online_.load()) {
-    std::string s = fmt::format("vector index is offline, please wait for online");
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(pb::error::Errno::EVECTOR_INDEX_OFFLINE, s);
-  }
-
   std::unique_ptr<faiss::idx_t[]> ids;
   try {
     ids.reset(new faiss::idx_t[delete_ids.size()]);
@@ -185,7 +169,7 @@ butil::Status VectorIndexFlat::Delete(const std::vector<uint64_t>& delete_ids) {
   size_t remove_count = 0;
   {
     BAIDU_SCOPED_LOCK(mutex_);
-    remove_count = index_->remove_ids(sel);
+    remove_count = index_id_map2_->remove_ids(sel);
   }
 
   if (0 == remove_count) {
@@ -197,14 +181,9 @@ butil::Status VectorIndexFlat::Delete(const std::vector<uint64_t>& delete_ids) {
 }
 
 butil::Status VectorIndexFlat::Search(std::vector<pb::common::VectorWithId> vector_with_ids, uint32_t topk,
+                                      std::vector<std::shared_ptr<FilterFunctor>> filters,
                                       std::vector<pb::index::VectorWithDistanceResult>& results,
-                                      [[maybe_unused]] bool reconstruct, const std::vector<uint64_t>& vector_ids) {
-  if (!is_online_.load()) {
-    std::string s = fmt::format("vector index is offline, please wait for online");
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(pb::error::Errno::EVECTOR_INDEX_OFFLINE, s);
-  }
-
+                                      bool reconstruct) {  // NOLINT
   if (vector_with_ids.empty()) {
     DINGO_LOG(WARNING) << "vector_with_ids is empty";
     return butil::Status::OK();
@@ -259,33 +238,16 @@ butil::Status VectorIndexFlat::Search(std::vector<pb::common::VectorWithId> vect
   }
 
   {
-    bool enable_filter = (!vector_ids.empty());
-
-    std::vector<uint64_t> internal_vector_ids;
-    internal_vector_ids.reserve(vector_ids.size());
-    for (auto vector_id : vector_ids) {
-      auto iter = index_->rev_map.find(static_cast<faiss::idx_t>(vector_id));
-      if (iter == index_->rev_map.end()) {
-        DINGO_LOG(WARNING) << fmt::format("vector_id : {} not exist . ignore", vector_id);
-        continue;
-      }
-      internal_vector_ids.push_back(iter->second);
-    }
-
-    // if all original id not found. ignore .result nothing
-    // if (internal_vector_ids.empty()) {
-    //   enable_filter = false;
-    // }
-
-    std::unique_ptr<SearchFilterForFlat> search_filter_for_flat_ptr =
-        std::make_unique<SearchFilterForFlat>(std::move(internal_vector_ids));
-    faiss::SearchParameters* param = enable_filter ? search_filter_for_flat_ptr.get() : nullptr;
-
     BAIDU_SCOPED_LOCK(mutex_);
-    if (enable_filter) {
-      SearchWithParam(vector_with_ids.size(), vectors.get(), topk, distances.data(), labels.data(), param);
+    if (!filters.empty()) {
+      // Build array index list.
+      for (auto& filter : filters) {
+        filter->Build(index_id_map2_->id_map);
+      }
+      auto flat_filter = filters.empty() ? nullptr : std::make_shared<FlatIDSelector>(filters);
+      SearchWithParam(vector_with_ids.size(), vectors.get(), topk, distances.data(), labels.data(), flat_filter);
     } else {
-      index_->search(vector_with_ids.size(), vectors.get(), topk, distances.data(), labels.data());
+      index_id_map2_->search(vector_with_ids.size(), vectors.get(), topk, distances.data(), labels.data());
     }
   }
 
@@ -293,20 +255,21 @@ butil::Status VectorIndexFlat::Search(std::vector<pb::common::VectorWithId> vect
     auto& result = results.emplace_back();
 
     for (size_t i = 0; i < topk; i++) {
-      if (labels[i + (row * topk)] < 0) {
+      size_t pos = row * topk + i;
+      if (labels[pos] < 0) {
         continue;
       }
       auto* vector_with_distance = result.add_vector_with_distances();
 
       auto* vector_with_id = vector_with_distance->mutable_vector_with_id();
-      vector_with_id->set_id(labels[i + (row * topk)]);
+      vector_with_id->set_id(labels[pos]);
       vector_with_id->mutable_vector()->set_dimension(dimension_);
       vector_with_id->mutable_vector()->set_value_type(::dingodb::pb::common::ValueType::FLOAT);
       if (metric_type_ == pb::common::MetricType::METRIC_TYPE_COSINE ||
           metric_type_ == pb::common::MetricType::METRIC_TYPE_INNER_PRODUCT) {
-        vector_with_distance->set_distance(1.0F - distances[i + (row * topk)]);
+        vector_with_distance->set_distance(1.0F - distances[pos]);
       } else {
-        vector_with_distance->set_distance(distances[i + (row * topk)]);
+        vector_with_distance->set_distance(distances[pos]);
       }
 
       vector_with_distance->set_metric_type(metric_type_);
@@ -317,18 +280,6 @@ butil::Status VectorIndexFlat::Search(std::vector<pb::common::VectorWithId> vect
 
   return butil::Status::OK();
 }
-
-butil::Status VectorIndexFlat::SetOffline() {
-  is_online_.store(false);
-  return butil::Status::OK();
-}
-
-butil::Status VectorIndexFlat::SetOnline() {
-  is_online_.store(true);
-  return butil::Status::OK();
-}
-
-bool VectorIndexFlat::IsOnline() { return is_online_.load(); }
 
 void VectorIndexFlat::LockWrite() { bthread_mutex_lock(&mutex_); }
 
@@ -345,7 +296,7 @@ butil::Status VectorIndexFlat::Load(const std::string& /*path*/) {
 int32_t VectorIndexFlat::GetDimension() { return this->dimension_; }
 
 butil::Status VectorIndexFlat::GetCount(uint64_t& count) {
-  count = index_->id_map.size();
+  count = index_id_map2_->id_map.size();
   return butil::Status::OK();
 }
 
@@ -355,14 +306,14 @@ butil::Status VectorIndexFlat::GetDeletedCount(uint64_t& deleted_count) {
 }
 
 butil::Status VectorIndexFlat::GetMemorySize(uint64_t& memory_size) {
-  auto count = index_->ntotal;
+  auto count = index_id_map2_->ntotal;
   if (count == 0) {
     memory_size = 0;
     return butil::Status::OK();
   }
 
   memory_size = count * sizeof(faiss::idx_t) + count * dimension_ * sizeof(faiss::Index::component_t) +
-                (sizeof(faiss::idx_t) + sizeof(faiss::idx_t)) * index_->rev_map.size();
+                (sizeof(faiss::idx_t) + sizeof(faiss::idx_t)) * index_id_map2_->rev_map.size();
   return butil::Status::OK();
 }
 
@@ -378,12 +329,14 @@ butil::Status VectorIndexFlat::NeedToSave(bool& need_to_save, [[maybe_unused]] u
 
 void VectorIndexFlat::SearchWithParam(faiss::idx_t n, const faiss::Index::component_t* x, faiss::idx_t k,
                                       faiss::Index::distance_t* distances, faiss::idx_t* labels,
-                                      const faiss::SearchParameters* params) {
-  raw_index_->search(n, x, k, distances, labels, params);
+                                      std::shared_ptr<FlatIDSelector> filters) {
+  faiss::SearchParameters param;
+  param.sel = filters.get();
+  raw_index_->search(n, x, k, distances, labels, &param);
   faiss::idx_t* li = labels;
 #pragma omp parallel for
-  for (faiss::idx_t i = 0; i < n * k; i++) {
-    li[i] = li[i] < 0 ? li[i] : index_->id_map[li[i]];
+  for (faiss::idx_t i = 0; i < n * k; ++i) {
+    li[i] = li[i] < 0 ? li[i] : index_id_map2_->id_map[li[i]];
   }
 }
 

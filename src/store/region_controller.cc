@@ -25,6 +25,7 @@
 #include "common/constant.h"
 #include "common/helper.h"
 #include "common/logging.h"
+#include "common/service_access.h"
 #include "config/config_manager.h"
 #include "event/store_state_machine_event.h"
 #include "fmt/core.h"
@@ -35,6 +36,7 @@
 #include "proto/error.pb.h"
 #include "server/server.h"
 #include "store/heartbeat.h"
+#include "vector/codec.h"
 #include "vector/vector_index_hnsw.h"
 #include "vector/vector_index_snapshot.h"
 
@@ -65,6 +67,22 @@ butil::Status CreateRegionTask::CreateRegion(std::shared_ptr<Context> ctx, store
   auto status = ValidateCreateRegion(store_meta_manager, region->Id());
   if (!status.ok()) {
     return status;
+  }
+
+  // Later delete
+  {
+    DINGO_LOG(INFO) << fmt::format(
+        "region {} range [{}-{}), raw_range: [{}-{})", region->Id(), Helper::StringToHex(region->Range().start_key()),
+        Helper::StringToHex(region->Range().end_key()), Helper::StringToHex(region->RawRange().start_key()),
+        Helper::StringToHex(region->RawRange().end_key()));
+
+    if (region->Type() == pb::common::INDEX_REGION) {
+      uint64_t min_vector_id = VectorCodec::DecodeVectorId(region->RawRange().start_key());
+      uint64_t max_vector_id = VectorCodec::DecodeVectorId(region->RawRange().end_key());
+      DINGO_LOG(INFO) << fmt::format("vector id range [{}-{}), raw_range: [{}-{})", min_vector_id, max_vector_id,
+                                     Helper::StringToHex(region->RawRange().start_key()),
+                                     Helper::StringToHex(region->RawRange().end_key()));
+    }
   }
 
   // Add region to store region meta manager
@@ -100,21 +118,6 @@ butil::Status CreateRegionTask::CreateRegion(std::shared_ptr<Context> ctx, store
   } else {
     store_region_meta->UpdateState(region, pb::common::StoreRegionState::STANDBY);
   }
-
-  // if (Server::GetInstance()->GetRole() == pb::common::ClusterRole::INDEX) {
-  //   // vector index
-  //   const auto& definition = region->InnerRegion().definition();
-  //   if (definition.index_parameter().index_type() == pb::common::IndexType::INDEX_TYPE_VECTOR) {
-  //     DINGO_LOG(INFO) << fmt::format("Create region {} vector index", region->Id());
-
-  //     auto vector_index_manager = Server::GetInstance()->GetVectorIndexManager();
-  //     if (!vector_index_manager->AddVectorIndex(region->Id(), region->InnerRegion().definition().index_parameter()))
-  //     {
-  //       return butil::Status(pb::error::EINTERNAL,
-  //                            fmt::format("Init vector index failed, region_id: {}", region->Id()));
-  //     }
-  //   }
-  // }
 
   return butil::Status();
 }
@@ -183,7 +186,7 @@ butil::Status DeleteRegionTask::DeleteRegion(std::shared_ptr<Context> ctx, uint6
   // Delete data
   DINGO_LOG(DEBUG) << fmt::format("Delete region {} delete data", region_id);
   auto writer = engine->GetRawEngine()->NewWriter(Constant::kStoreDataCF);
-  writer->KvDeleteRange(region->RawRange());
+  writer->KvBatchDeleteRange(region->PhysicsRange());
 
   // Raft kv engine
   if (engine->GetID() == pb::common::ENG_RAFT_STORE) {
@@ -208,8 +211,20 @@ butil::Status DeleteRegionTask::DeleteRegion(std::shared_ptr<Context> ctx, uint6
 
   // Index region
   if (Server::GetInstance()->GetRole() == pb::common::ClusterRole::INDEX) {
-    // Delete vector index
-    Server::GetInstance()->GetVectorIndexManager()->DeleteVectorIndex(region_id);
+    auto vector_index_manager = Server::GetInstance()->GetVectorIndexManager();
+    if (vector_index_manager != nullptr) {
+      auto vector_index = vector_index_manager->GetVectorIndex(region_id);
+      if (vector_index != nullptr) {
+        // Delete vector index
+        vector_index_manager->DeleteVectorIndex(vector_index->Id());
+      }
+
+      // Delete vector index snapshot
+      auto snapshot_manager = vector_index_manager->GetVectorIndexSnapshotManager();
+      if (snapshot_manager != nullptr) {
+        snapshot_manager->DeleteSnapshots(region_id);
+      }
+    }
   }
 
   // Delete region executor
@@ -274,7 +289,7 @@ butil::Status SplitRegionTask::ValidateSplitRegion(std::shared_ptr<StoreRegionMe
   }
 
   const auto& split_key = split_request.split_watershed_key();
-  auto range = parent_region->Range();
+  auto range = parent_region->RawRange();
   if (range.start_key().compare(split_key) >= 0 || range.end_key().compare(split_key) <= 0) {
     return butil::Status(pb::error::EKEY_INVALID, "Split key is invalid.");
   }
@@ -301,6 +316,30 @@ butil::Status SplitRegionTask::ValidateSplitRegion(std::shared_ptr<StoreRegionMe
     if (!node->IsLeader()) {
       return butil::Status(pb::error::ERAFT_NOTLEADER, node->GetLeaderId().to_string());
     }
+
+    if (parent_region->Type() == pb::common::INDEX_REGION) {
+      // Check follower whether hold vector index.
+      auto self_peer = node->GetPeerId();
+      std::vector<braft::PeerId> peers;
+      node->ListPeers(&peers);
+      for (const auto& peer : peers) {
+        if (peer != self_peer) {
+          pb::node::CheckVectorIndexRequest request;
+          request.set_vector_index_id(parent_region_id);
+          pb::node::CheckVectorIndexResponse response;
+          auto status = ServiceAccess::CheckVectorIndex(request, peer.addr, response);
+          if (!status.ok()) {
+            DINGO_LOG(ERROR) << fmt::format("Check peer {} hold vector index {} failed, error: {}",
+                                            Helper::EndPointToStr(peer.addr), parent_region_id, status.error_str());
+          }
+
+          if (!response.is_exist()) {
+            return butil::Status(pb::error::EVECTOR_INDEX_NOT_FOUND, "Not found vector index %lu at peer %s",
+                                 parent_region_id, Helper::EndPointToStr(peer.addr).c_str());
+          }
+        }
+      }
+    }
   }
 
   return butil::Status();
@@ -315,7 +354,6 @@ butil::Status SplitRegionTask::SplitRegion() {
   }
 
   // Commit raft log
-
   ctx_->SetRegionId(region_cmd_->split_request().split_from_region_id());
   return Server::GetInstance()->GetEngine()->AsyncWrite(ctx_,
                                                         WriteDataBuilder::BuildWrite(region_cmd_->split_request()),
@@ -329,8 +367,9 @@ butil::Status SplitRegionTask::SplitRegion() {
 void SplitRegionTask::Run() {
   auto status = SplitRegion();
   if (!status.ok()) {
-    DINGO_LOG(DEBUG) << fmt::format("Split region {} failed, {}", region_cmd_->split_request().split_from_region_id(),
-                                    status.error_str());
+    DINGO_LOG(DEBUG) << fmt::format("[split.spliting][region({}->{})] Split failed, error: {}",
+                                    region_cmd_->split_request().split_from_region_id(),
+                                    region_cmd_->split_request().split_to_region_id(), status.error_str());
   }
 
   Server::GetInstance()->GetRegionCommandManager()->UpdateCommandStatus(
@@ -349,6 +388,24 @@ butil::Status ChangeRegionTask::PreValidateChangeRegion(const pb::coordinator::R
   return ValidateChangeRegion(store_meta_manager, command.change_peer_request().region_definition());
 }
 
+// Check region leader
+static butil::Status CheckLeader(uint64_t region_id) {
+  auto engine = Server::GetInstance()->GetEngine();
+  if (engine->GetID() == pb::common::ENG_RAFT_STORE) {
+    auto raft_kv_engine = std::dynamic_pointer_cast<RaftStoreEngine>(engine);
+    auto node = raft_kv_engine->GetNode(region_id);
+    if (node == nullptr) {
+      return butil::Status(pb::error::ERAFT_NOT_FOUND, "No found raft node.");
+    }
+
+    if (!node->IsLeader()) {
+      return butil::Status(pb::error::ERAFT_NOTLEADER, node->GetLeaderId().to_string());
+    }
+  }
+
+  return butil::Status();
+}
+
 butil::Status ChangeRegionTask::ValidateChangeRegion(std::shared_ptr<StoreMetaManager> store_meta_manager,
                                                      const pb::common::RegionDefinition& region_definition) {
   auto region = store_meta_manager->GetStoreRegionMeta()->GetRegion(region_definition.id());
@@ -360,20 +417,7 @@ butil::Status ChangeRegionTask::ValidateChangeRegion(std::shared_ptr<StoreMetaMa
     return butil::Status(pb::error::EREGION_STATE, "Region state not allow change.");
   }
 
-  auto engine = Server::GetInstance()->GetEngine();
-  if (engine->GetID() == pb::common::ENG_RAFT_STORE) {
-    auto raft_kv_engine = std::dynamic_pointer_cast<RaftStoreEngine>(engine);
-    auto node = raft_kv_engine->GetNode(region_definition.id());
-    if (node == nullptr) {
-      return butil::Status(pb::error::ERAFT_NOT_FOUND, "No found raft node.");
-    }
-
-    if (!node->IsLeader()) {
-      return butil::Status(pb::error::ERAFT_NOTLEADER, node->GetLeaderId().to_string());
-    }
-  }
-
-  return butil::Status();
+  return CheckLeader(region_definition.id());
 }
 
 butil::Status ChangeRegionTask::ChangeRegion(std::shared_ptr<Context> ctx,
@@ -638,8 +682,6 @@ butil::Status SnapshotVectorIndexTask::SaveSnapshot(std::shared_ptr<Context> /*c
     return butil::Status(pb::error::EINTERNAL, "Vector index manager is nullptr");
   }
 
-  // return vector_index_manager->RebuildVectorIndex(region);
-
   auto vector_index = vector_index_manager->GetVectorIndex(vector_index_id);
   if (vector_index == nullptr) {
     return butil::Status(pb::error::EVECTOR_INDEX_NOT_FOUND, fmt::format("Not found vector index {}", vector_index_id));
@@ -650,7 +692,7 @@ butil::Status SnapshotVectorIndexTask::SaveSnapshot(std::shared_ptr<Context> /*c
   if (!status.ok()) {
     return status;
   }
-  vector_index_manager->UpdateSnapshotLogIndex(vector_index, snapshot_log_index);
+  vector_index_manager->UpdateSnapshotLogId(vector_index, snapshot_log_index);
 
   return butil::Status();
 }
@@ -802,6 +844,77 @@ butil::Status SwitchSplitTask::SwitchSplit(std::shared_ptr<Context>, uint64_t re
   region->SetDisableSplit(disable_split);
 
   return butil::Status();
+}
+
+butil::Status HoldVectorIndexTask::PreValidateHoldVectorIndex(const pb::coordinator::RegionCmd& command) {
+  return ValidateHoldVectorIndex(command.hold_vector_index_request().region_id());
+}
+
+butil::Status HoldVectorIndexTask::ValidateHoldVectorIndex(uint64_t region_id) {
+  // Validate region exist.
+  auto store_region_meta = Server::GetInstance()->GetStoreMetaManager()->GetStoreRegionMeta();
+  auto region = store_region_meta->GetRegion(region_id);
+  if (region == nullptr) {
+    return butil::Status(pb::error::EREGION_NOT_FOUND, fmt::format("Not found region {}", region_id));
+  }
+
+  // Validate is follower
+  auto engine = Server::GetInstance()->GetEngine();
+  if (engine->GetID() == pb::common::ENG_RAFT_STORE) {
+    auto raft_kv_engine = std::dynamic_pointer_cast<RaftStoreEngine>(engine);
+    auto node = raft_kv_engine->GetNode(region_id);
+    if (node == nullptr) {
+      return butil::Status(pb::error::ERAFT_NOT_FOUND, "No found raft node %lu.", region_id);
+    }
+  }
+
+  return butil::Status();
+}
+
+butil::Status HoldVectorIndexTask::HoldVectorIndex(std::shared_ptr<Context> ctx, uint64_t region_id, bool is_hold) {
+  auto status = ValidateHoldVectorIndex(region_id);
+  if (!status.ok()) {
+    return status;
+  }
+
+  auto vector_index_manager = Server::GetInstance()->GetVectorIndexManager();
+  auto vector_index = vector_index_manager->GetVectorIndex(region_id);
+
+  if (is_hold) {
+    // Load vector index.
+    if (vector_index == nullptr) {
+      auto status = vector_index_manager->LoadOrBuildVectorIndex(region_id);
+      if (!status.ok()) {
+        DINGO_LOG(ERROR) << fmt::format(
+            "[vector_index.hold][index_id({})] load or build vector index failed, error: {}", region_id,
+            status.error_str());
+      } else {
+        DINGO_LOG(INFO) << fmt::format("[vector_index.hold][index_id({})] load or build vector index finish",
+                                       region_id);
+      }
+    }
+  } else {
+    // Delete vector index.
+    if (vector_index != nullptr) {
+      DINGO_LOG(INFO) << fmt::format("[vector_index.hold][region({})] delete vector index.", region_id);
+      vector_index_manager->DeleteVectorIndex(region_id);
+    }
+  }
+
+  return butil::Status();
+}
+
+void HoldVectorIndexTask::Run() {
+  auto status = HoldVectorIndex(ctx_, region_cmd_->hold_vector_index_request().region_id(),
+                                region_cmd_->hold_vector_index_request().is_hold());
+  if (!status.ok()) {
+    DINGO_LOG(DEBUG) << fmt::format("HoldVectorIndex executor region {} failed, {}",
+                                    region_cmd_->switch_split_request().region_id(), status.error_str());
+  }
+
+  Server::GetInstance()->GetRegionCommandManager()->UpdateCommandStatus(
+      region_cmd_,
+      status.ok() ? pb::coordinator::RegionCmdStatus::STATUS_DONE : pb::coordinator::RegionCmdStatus::STATUS_FAIL);
 }
 
 bool ControlExecutor::Init() {
@@ -1190,6 +1303,10 @@ RegionController::TaskBuilderMap RegionController::task_builders = {
      [](std::shared_ptr<Context> ctx, std::shared_ptr<pb::coordinator::RegionCmd> command) -> TaskRunnable* {
        return new SwitchSplitTask(ctx, command);
      }},
+    {pb::coordinator::CMD_HOLD_VECTOR_INDEX,
+     [](std::shared_ptr<Context> ctx, std::shared_ptr<pb::coordinator::RegionCmd> command) -> TaskRunnable* {
+       return new HoldVectorIndexTask(ctx, command);
+     }},
 };
 
 RegionController::ValidaterMap RegionController::validaters = {
@@ -1202,6 +1319,7 @@ RegionController::ValidaterMap RegionController::validaters = {
     {pb::coordinator::CMD_STOP, StopRegionTask::PreValidateStopRegion},
     {pb::coordinator::CMD_UPDATE_DEFINITION, UpdateDefinitionTask::PreValidateUpdateDefinition},
     {pb::coordinator::CMD_SWITCH_SPLIT, SwitchSplitTask::PreValidateSwitchSplit},
+    {pb::coordinator::CMD_HOLD_VECTOR_INDEX, HoldVectorIndexTask::PreValidateHoldVectorIndex},
 };
 
 }  // namespace dingodb

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef DINGODB_CLIENT_STORE_CLIENT_FUNCTION_H_
+#ifndef DINGODB_CLIENT_STORE_CLIENT_FUNCTION_H_  // NOLINT
 #define DINGODB_CLIENT_STORE_CLIENT_FUNCTION_H_
 
 #include <cstdint>
@@ -31,6 +31,19 @@ struct Context {
     clone_ctx->table_name = table_name;
     clone_ctx->partition_num = partition_num;
     clone_ctx->req_num = req_num;
+    clone_ctx->table_id = table_id;
+    clone_ctx->region_id = region_id;
+
+    clone_ctx->thread_num = thread_num;
+    clone_ctx->thread_no = thread_no;
+    clone_ctx->prefix = prefix;
+
+    clone_ctx->dimension = dimension;
+    clone_ctx->start_id = start_id;
+    clone_ctx->count = count;
+    clone_ctx->step_count = step_count;
+    clone_ctx->with_scalar = with_scalar;
+    clone_ctx->with_table = with_table;
 
     return clone_ctx;
   }
@@ -41,6 +54,21 @@ struct Context {
   std::string table_name;
   int partition_num;
   int req_num;
+
+  uint64_t table_id;
+  uint64_t region_id;
+
+  int32_t thread_num;
+  int32_t thread_no;
+  std::string prefix;
+
+  uint32_t dimension;
+  uint32_t start_id;
+  uint32_t count;
+  uint32_t step_count;
+
+  bool with_scalar;
+  bool with_table;
 };
 
 // coordinator
@@ -49,18 +77,23 @@ dingodb::pb::common::Region SendQueryRegion(ServerInteractionPtr interaction, ui
 // vector
 void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint64_t vector_id,
                       uint32_t topn);
+void SendVectorSearchDebug(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension,
+                           uint64_t start_vector_id, uint32_t topn, uint32_t batch_count, const std::string& key,
+                           const std::string& value);
 void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint64_t vector_id,
                            uint32_t topn, uint32_t batch_count);
 void SendVectorBatchQuery(ServerInteractionPtr interaction, uint64_t region_id, std::vector<uint64_t> vector_ids);
-void SendVectorAdd(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t start_id,
-                   uint32_t count, uint32_t step_count);
+void SendVectorAddRetry(std::shared_ptr<Context> ctx);
+void SendVectorAdd(std::shared_ptr<Context> ctx);
 void SendVectorDelete(ServerInteractionPtr interaction, uint64_t region_id, uint32_t start_id, uint32_t count);
 void SendVectorGetMaxId(ServerInteractionPtr interaction, uint64_t region_id);
 void SendVectorGetMinId(ServerInteractionPtr interaction, uint64_t region_id);
 void SendVectorAddBatch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t count,
                         uint32_t step_count, int64_t start_id, const std::string& file);
-void SendVectorScanQuery(ServerInteractionPtr interaction, uint64_t region_id, uint64_t start_id, uint64_t limit,
-                         bool is_reverse);
+void SendVectorScanQuery(ServerInteractionPtr interaction, uint64_t region_id, uint64_t start_id, uint64_t end_id,
+                         uint64_t limit, bool is_reverse);
+void SendVectorAddBatchDebug(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t count,
+                             uint32_t step_count, int64_t start_id, const std::string& file);
 void SendVectorGetRegionMetrics(ServerInteractionPtr interaction, uint64_t region_id);
 void SendVectorCalcDistance(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension,
                             const std::string& alg_type, const std::string& metric_type, int32_t left_vector_size,
@@ -69,7 +102,7 @@ void SendVectorCalcDistance(ServerInteractionPtr interaction, uint64_t region_id
 // key/value
 void SendKvGet(ServerInteractionPtr interaction, uint64_t region_id, const std::string& key, std::string& value);
 void SendKvBatchGet(ServerInteractionPtr interaction, uint64_t region_id, const std::string& prefix, int count);
-void SendKvPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& key, std::string value = "");
+int SendKvPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& key, std::string value = "");
 void SendKvBatchPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& prefix, int count);
 void SendKvPutIfAbsent(ServerInteractionPtr interaction, uint64_t region_id, const std::string& key);
 void SendKvBatchPutIfAbsent(ServerInteractionPtr interaction, uint64_t region_id, const std::string& prefix, int count);
@@ -92,8 +125,7 @@ void BatchSendAddRegion(ServerInteractionPtr interaction, int start_region_id, i
 void SendSnapshotVectorIndex(ServerInteractionPtr interaction, uint64_t vector_index_id);
 
 // test
-void TestBatchPut(ServerInteractionPtr interaction, uint64_t region_id, int thread_num, int req_num,
-                  const std::string& prefix);
+void TestBatchPut(std::shared_ptr<Context> ctx);
 void TestBatchPutGet(ServerInteractionPtr interaction, uint64_t region_id, int thread_num, int req_num,
                      const std::string& prefix);
 void TestRegionLifecycle(ServerInteractionPtr interaction, uint64_t region_id, const std::string& raft_group,
@@ -105,6 +137,9 @@ void AutoTest(std::shared_ptr<Context> ctx);
 
 // Table
 void AutoDropTable(std::shared_ptr<Context> ctx);
+
+void CheckTableDistribution(std::shared_ptr<Context> ctx);
+void CheckIndexDistribution(std::shared_ptr<Context> ctx);
 
 }  // namespace client
 

@@ -223,22 +223,29 @@ static pb::common::RegionMetrics GetRegionActualMetrics(uint64_t region_id) {
   if (region == nullptr) {
     return region_metrics;
   }
-  auto raw_engine = Server::GetInstance()->GetRawEngine();
 
-  IteratorOptions options;
-  options.upper_bound = region->Range().end_key();
-  auto iter = raw_engine->NewIterator(Constant::kStoreDataCF, options);
+  auto raw_engine = Server::GetInstance()->GetRawEngine();
 
   int32_t size = 0;
   int32_t key_count = 0;
   std::string min_key, max_key;
-  for (iter->Seek(region->Range().start_key()); iter->Valid(); iter->Next()) {
-    size += iter->Key().size() + iter->Value().size();
-    ++key_count;
-    if (min_key.empty()) {
-      min_key = iter->Key();
+  auto ranges = region->PhysicsRange();
+  for (int i = 0; i < ranges.size(); ++i) {
+    auto range = ranges[i];
+    IteratorOptions options;
+    options.upper_bound = range.end_key();
+    auto iter = raw_engine->NewIterator(Constant::kStoreDataCF, options);
+
+    for (iter->Seek(range.start_key()); iter->Valid(); iter->Next()) {
+      size += iter->Key().size() + iter->Value().size();
+      if (i == 0) {
+        ++key_count;
+        if (min_key.empty()) {
+          min_key = iter->Key();
+        }
+        max_key = iter->Key();
+      }
     }
-    max_key = iter->Key();
   }
 
   region_metrics.set_min_key(min_key);
@@ -367,6 +374,9 @@ void RegionControlServiceImpl::Debug(google::protobuf::RpcController* controller
     }
   } else if (request->type() == pb::region_control::DebugType::INDEX_VECTOR_INDEX_METRICS) {
     auto vector_index_manager = Server::GetInstance()->GetVectorIndexManager();
+    if (vector_index_manager == nullptr) {
+      return;
+    }
     std::vector<std::shared_ptr<VectorIndex>> vector_indexs;
     if (request->region_ids().empty()) {
       vector_indexs = vector_index_manager->GetAllVectorIndex();
@@ -383,6 +393,7 @@ void RegionControlServiceImpl::Debug(google::protobuf::RpcController* controller
       auto* entry = response->mutable_vector_index_metrics()->add_entries();
 
       entry->set_id(vector_index->Id());
+      entry->set_version(vector_index->Version());
       entry->set_dimension(vector_index->GetDimension());
       entry->set_apply_log_index(vector_index->ApplyLogIndex());
       entry->set_snapshot_log_index(vector_index->SnapshotLogIndex());

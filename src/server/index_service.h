@@ -50,16 +50,31 @@ class IndexServiceImpl : public pb::index::IndexService {
                           ::dingodb::pb::index::VectorCalcDistanceResponse* response,
                           ::google::protobuf::Closure* done) override;
 
+  // for debug
+  void VectorSearchDebug(google::protobuf::RpcController* controller,
+                         const pb::index::VectorSearchDebugRequest* request,
+                         pb::index::VectorSearchDebugResponse* response, google::protobuf::Closure* done) override;
+
   void SetStorage(std::shared_ptr<Storage> storage);
 
  private:
-  butil::Status ValidateVectorBatchQueryQequest(const dingodb::pb::index::VectorBatchQueryRequest* request);
-  butil::Status ValidateVectorSearchRequest(const dingodb::pb::index::VectorSearchRequest* request);
-  butil::Status ValidateVectorAddRequest(const dingodb::pb::index::VectorAddRequest* request);
-  butil::Status ValidateVectorDeleteRequest(const dingodb::pb::index::VectorDeleteRequest* request);
-  butil::Status ValidateVectorGetBorderIdRequest(const dingodb::pb::index::VectorGetBorderIdRequest* request);
-  butil::Status ValidateVectorScanQueryRequest(const dingodb::pb::index::VectorScanQueryRequest* request);
-  butil::Status ValidateVectorGetRegionMetricsRequest(const dingodb::pb::index::VectorGetRegionMetricsRequest* request);
+  butil::Status ValidateVectorBatchQueryQequest(const dingodb::pb::index::VectorBatchQueryRequest* request,
+                                                store::RegionPtr region);
+  butil::Status ValidateVectorSearchRequest(const dingodb::pb::index::VectorSearchRequest* request,
+                                            store::RegionPtr region);
+  butil::Status ValidateVectorAddRequest(const dingodb::pb::index::VectorAddRequest* request, store::RegionPtr region);
+  butil::Status ValidateVectorDeleteRequest(const dingodb::pb::index::VectorDeleteRequest* request,
+                                            store::RegionPtr region);
+  butil::Status ValidateVectorGetBorderIdRequest(const dingodb::pb::index::VectorGetBorderIdRequest* request,
+                                                 store::RegionPtr region);
+  butil::Status ValidateVectorScanQueryRequest(const dingodb::pb::index::VectorScanQueryRequest* request,
+                                               store::RegionPtr region);
+  butil::Status ValidateVectorGetRegionMetricsRequest(const dingodb::pb::index::VectorGetRegionMetricsRequest* request,
+                                                      store::RegionPtr region);
+  // This function is for testing only
+  butil::Status ValidateVectorSearchDebugRequest(const dingodb::pb::index::VectorSearchDebugRequest* request,
+                                                 store::RegionPtr region);
+
   std::shared_ptr<Storage> storage_;
 };
 

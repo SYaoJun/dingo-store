@@ -16,6 +16,7 @@
 
 package io.dingodb.sdk.common.vector;
 
+import io.dingodb.sdk.service.store.Coprocessor;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 
@@ -31,5 +32,21 @@ public class VectorSearchParameter {
     private List<String> selectedKeys;
     private Search search;
 
-    private boolean useScalarFilter;
+    private VectorFilter vectorFilter;
+    private VectorFilterType vectorFilterType;
+    private Coprocessor coprocessor;
+    private List<Long> vectorIds;
+
+    public enum VectorFilter {
+        SCALAR_FILTER,
+        TABLE_FILTER,
+        VECTOR_ID_FILTER
+    }
+
+    public enum VectorFilterType {
+        // first vector search, then filter
+        QUERY_POST,
+        // first search from rocksdb, then search vector
+        QUERY_PRE
+    }
 }

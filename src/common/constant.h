@@ -50,10 +50,15 @@ class Constant {
   // Define region controller prefix.
   inline static const std::string kStoreRegionControlCommandPrefix = "CONTROL_CMD";
   // Define vector index apply max log prefix.
-  inline static const std::string kVectorIndexApplyLogPrefix = "VECTOR_INDEX_APPLY_LOG";
+  inline static const std::string kVectorIndexApplyLogIdPrefix = "VECTOR_INDEX_APPLY_LOG";
+  // Define vector index snapshot max log prefix.
+  inline static const std::string kVectorIndexSnapshotLogIdPrefix = "VECTOR_INDEX_SNAPSHOT_LOG";
 
   // Define loading snapshot flag.
   inline static const std::string kIsLoadingSnapshot = "IS_LOADING_SNAPSHOT";
+
+  // Define default raft snapshot policy
+  inline static const std::string kDefaultRaftSnapshotPolicy = "checkpoint";
 
   // flat map init capacity
   static const uint64_t kStoreRegionMetaInitCapacity = 1024;
@@ -93,18 +98,39 @@ class Constant {
   static const bool kSegmentLogSync = true;
   static const uint32_t kSegmentLogSyncPerBytes = INT32_MAX;
 
+  // vector data number, e.g. data/scalar/table
+  static const uint32_t kVectorDataCategoryNum = 3;
   // vector key prefix
-  static const uint8_t kVectorIdPrefix = 0x01;
+  static const uint8_t kVectorDataPrefix = 0x01;
   static const uint8_t kVectorScalarPrefix = 0x02;
-  static const uint8_t kVectorWalPrefix = 0x03;
-  static const uint8_t kVectorTablePrefix = 0x04;
+  static const uint8_t kVectorTablePrefix = 0x03;
 
   // File transport chunk size
   static const uint32_t kFileTransportChunkSize = 1024 * 1024;  // 1M
-                                                                //
+
   // vector limitations
   static const uint32_t kVectorMaxDimension = 32768;
   static const uint64_t kVectorIndexSaveSnapshotThresholdWriteKeyNum = 10000;
+
+  static const uint32_t kLoadOrBuildVectorIndexConcurrency = 5;
+
+  static const uint32_t kBuildVectorIndexBatchSize = 4096;
+
+  // split region
+  static const uint32_t kDefaultStoreSplitCheckIntervalS = 60;
+  static const uint32_t kDefaultIndexSplitCheckIntervalS = 120;
+  static const uint32_t kDefaultSplitCheckConcurrency = 5;
+  inline static const std::string kDefaultSplitPolicy = "HALF";
+  static const uint32_t kDefaultRegionMaxSize = 134217728;  // 128M
+  static constexpr float kDefaultSplitCheckApproximateSizeRatio = 0.8;
+  static const uint32_t kDefaultSplitChunkSize = 1048576;  // 1M
+  static constexpr float kDefaultSplitRatio = 0.5;
+  static const uint32_t kDefaultSplitKeysNumber = 200000;
+  static constexpr float kDefaultSplitKeysRatio = 0.5;
+
+  // collect metrics
+  static const uint32_t kApproximateSizeMetricsCollectIntervalS = 50;
+  static const uint32_t kMetricsCollectIntervalS = 300;
 };
 
 }  // namespace dingodb

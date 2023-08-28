@@ -14,36 +14,37 @@
 
 #include "special.h"
 
-namespace dingodb::expr {
+namespace dingodb::expr
+{
 
-template <>
-bool CalcIsTrue(const wrap<bool> &v) {
-  return v.has_value() && *v;
+template <> bool CalcIsTrue(const wrap<bool> &v)
+{
+    return v.has_value() && *v;
 }
 
-template <>
-bool CalcIsTrue(const wrap<int32_t> &v) {
-  return v.has_value() && *v != 0;
+template <> bool CalcIsTrue(const wrap<int32_t> &v)
+{
+    return v.has_value() && *v != 0;
 }
 
-template <>
-bool CalcIsTrue(const wrap<int64_t> &v) {
-  return v.has_value() && *v != 0;
+template <> bool CalcIsTrue(const wrap<int64_t> &v)
+{
+    return v.has_value() && *v != 0;
 }
 
-template <>
-bool CalcIsFalse(const wrap<bool> &v) {
-  return v.has_value() && !*v;
+template <> bool CalcIsFalse(const wrap<bool> &v)
+{
+    return v.has_value() && !*v;
 }
 
-template <>
-bool CalcIsFalse(const wrap<int32_t> &v) {
-  return v.has_value() && *v != 0;
+template <> bool CalcIsFalse(const wrap<int32_t> &v)
+{
+    return v.has_value() && *v != 0;
 }
 
-template <>
-bool CalcIsFalse(const wrap<int64_t> &v) {
-  return v.has_value() && *v != 0;
+template <> bool CalcIsFalse(const wrap<int64_t> &v)
+{
+    return v.has_value() && *v != 0;
 }
 
-}  // namespace dingodb::expr
+} // namespace dingodb::expr

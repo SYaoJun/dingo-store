@@ -40,6 +40,28 @@
 
 namespace dingodb {
 
+// Filter vector id
+class FlatIDSelector : public faiss::IDSelector {
+ public:
+  FlatIDSelector(std::vector<std::shared_ptr<VectorIndex::FilterFunctor>> filters) : filters_(filters) {}
+  ~FlatIDSelector() override = default;
+  bool is_member(faiss::idx_t id) const override {  // NOLINT
+    if (filters_.empty()) {
+      return true;
+    }
+    for (const auto& filter : filters_) {
+      if (!filter->Check(id)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+ private:
+  std::vector<std::shared_ptr<VectorIndex::FilterFunctor>> filters_;
+};
+
 class VectorIndexFlat : public VectorIndex {
  public:
   explicit VectorIndexFlat(uint64_t id, const pb::common::VectorIndexParameter& vector_index_parameter);
@@ -65,12 +87,8 @@ class VectorIndexFlat : public VectorIndex {
   butil::Status Delete(const std::vector<uint64_t>& delete_ids) override;
 
   butil::Status Search(std::vector<pb::common::VectorWithId> vector_with_ids, uint32_t topk,
-                       std::vector<pb::index::VectorWithDistanceResult>& results, bool reconstruct = false,
-                       const std::vector<uint64_t>& vector_ids = {}) override;
-
-  butil::Status SetOnline() override;
-  butil::Status SetOffline() override;
-  bool IsOnline() override;
+                       std::vector<std::shared_ptr<FilterFunctor>> filters,
+                       std::vector<pb::index::VectorWithDistanceResult>& results, bool reconstruct = false) override;
 
   void LockWrite() override;
   void UnlockWrite() override;
@@ -88,7 +106,7 @@ class VectorIndexFlat : public VectorIndex {
  private:
   void SearchWithParam(faiss::idx_t n, const faiss::Index::component_t* x, faiss::idx_t k,
                        faiss::Index::distance_t* distances, faiss::idx_t* labels,
-                       const faiss::SearchParameters* params);
+                       std::shared_ptr<FlatIDSelector> filters);
   // Dimension of the elements
   faiss::idx_t dimension_;
 
@@ -97,10 +115,9 @@ class VectorIndexFlat : public VectorIndex {
 
   std::unique_ptr<faiss::Index> raw_index_;
 
-  std::unique_ptr<faiss::IndexIDMap2> index_;
+  std::unique_ptr<faiss::IndexIDMap2> index_id_map2_;
 
   bthread_mutex_t mutex_;
-  std::atomic<bool> is_online_;
 
   // normalize vector
   bool normalize_;

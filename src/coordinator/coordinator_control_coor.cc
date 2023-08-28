@@ -849,8 +849,15 @@ butil::Status CoordinatorControl::SelectStore(pb::common::StoreType store_type, 
     pb::common::Store store;
     uint64_t weight;
     uint64_t region_num;
-    uint64_t free_capacity;
-    uint64_t total_capacity;
+    uint64_t system_total_capacity;  // total capacity of this store
+    uint64_t system_free_capacity;   // free capacity of this store
+    uint64_t system_cpu_usage;       // cpu usage of this store process
+    uint64_t system_total_memory;    // total memory of the host this store process running on
+    uint64_t system_free_memory;     // total free memory of the host this store process running on
+    uint64_t system_io_util;         // io utilization of the host this store process running on
+    uint64_t process_used_cpu;       // cpu usage of this store process
+    uint64_t process_used_memory;    // total used memory of this store process
+    uint64_t process_used_capacity;  // free capacity of this store
   };
 
   // check and sort store by capacity, regions_num
@@ -861,30 +868,46 @@ butil::Status CoordinatorControl::SelectStore(pb::common::StoreType store_type, 
       StoreMore store_more;
       store_more.store = it;
 
+      bool has_metrics = false;
       auto* ptr = store_metrics_map_.seek(it.id());
       if (ptr != nullptr) {
         store_more.region_num = ptr->region_metrics_map_size() > 0 ? ptr->region_metrics_map_size() : 0;
-        store_more.free_capacity = ptr->free_capacity() > 0 ? ptr->free_capacity() : 0;
-        store_more.total_capacity = ptr->total_capacity() > 0 ? ptr->total_capacity() : 0;
-      } else {
-        store_more.region_num = 0;
-        store_more.free_capacity = 0;
-        store_more.total_capacity = 0;
+        store_more.system_free_capacity = ptr->system_free_capacity() > 0 ? ptr->system_free_capacity() : 0;
+        store_more.system_total_capacity = ptr->system_total_capacity() > 0 ? ptr->system_total_capacity() : 0;
+        store_more.system_total_memory = ptr->system_total_memory() > 0 ? ptr->system_free_memory() : 0;
+        store_more.system_free_memory = ptr->system_free_memory() > 0 ? ptr->system_free_memory() : 0;
+        has_metrics = true;
       }
 
-      if (store_more.total_capacity == 0) {
+      if (has_metrics) {
+        if (store_type == pb::common::StoreType::NODE_TYPE_STORE) {
+          store_more.weight = store_more.system_free_capacity * 100 / store_more.system_total_capacity +
+                              (100 / (store_more.region_num + 1));
+        } else if (store_type == pb::common::StoreType::NODE_TYPE_INDEX) {
+          store_more.weight = store_more.system_free_memory * 100 / store_more.system_total_memory +
+                              (100 / (store_more.region_num + 1));
+        }
+
+        if (store_more.system_total_capacity == 0) {
+          store_more.weight = 0;
+        }
+
+        if (store_more.system_free_memory == 0) {
+          store_more.weight = 0;
+        }
+
+        store_more.weight = store_more.weight * Helper::GenerateRealRandomInteger(1, 20);
+      } else {
         store_more.weight = 0;
-      } else {
-        store_more.weight =
-            store_more.free_capacity * 100 / store_more.total_capacity + (100 / (store_more.region_num + 1));
       }
-
-      store_more.weight = Helper::GenerateRandomInteger(0, 20);
 
       store_more_vec.push_back(store_more);
       DINGO_LOG(INFO) << "store_more_vec.push_back store_id=" << store_more.store.id()
-                      << ", region_num=" << store_more.region_num << ", free_capacity=" << store_more.free_capacity
-                      << ", total_capacity=" << store_more.total_capacity << ", weight=" << store_more.weight;
+                      << ", region_num=" << store_more.region_num
+                      << ", free_capacity=" << store_more.system_free_capacity
+                      << ", total_capacity=" << store_more.system_total_capacity
+                      << ", free_memory=" << store_more.system_free_memory
+                      << ", total_memory=" << store_more.system_total_memory << ", weight=" << store_more.weight;
     }
   }
 
@@ -926,7 +949,7 @@ butil::Status CoordinatorControl::CreateRegion(const std::string& region_name, p
 
   // setup store_type
   pb::common::StoreType store_type = pb::common::StoreType::NODE_TYPE_STORE;
-  if (region_type == pb::common::RegionType::INDEX_REGION) {
+  if (region_type == pb::common::RegionType::INDEX_REGION && index_parameter.has_vector_index_parameter()) {
     store_type = pb::common::StoreType::NODE_TYPE_INDEX;
   }
 
@@ -1361,8 +1384,8 @@ butil::Status CoordinatorControl::SplitRegionWithTaskList(uint64_t split_from_re
     return butil::Status(pb::error::Errno::EILLEGAL_PARAMTETERS, "SplitRegion split_watershed_key is empty");
   }
 
-  if (split_from_region.definition().range().start_key().compare(split_watershed_key) >= 0 ||
-      split_from_region.definition().range().end_key().compare(split_watershed_key) <= 0) {
+  if (split_from_region.definition().raw_range().start_key().compare(split_watershed_key) >= 0 ||
+      split_from_region.definition().raw_range().end_key().compare(split_watershed_key) <= 0) {
     DINGO_LOG(ERROR) << "SplitRegion split_watershed_key is illegal, split_watershed_key = "
                      << Helper::StringToHex(split_watershed_key) << ", split_from_region_id = " << split_from_region_id
                      << " start_key=" << Helper::StringToHex(split_from_region.definition().range().start_key())
@@ -1388,13 +1411,19 @@ butil::Status CoordinatorControl::SplitRegionWithTaskList(uint64_t split_from_re
                          "SplitRegion split_from_region_id's leader_store_id is 0");
   }
 
-  // create task list
-  auto* new_task_list = CreateTaskList(meta_increment);
-
   // call create_region to get store_operations
   pb::coordinator_internal::MetaIncrement meta_increment_tmp;
   uint64_t new_region_id = GetNextId(pb::coordinator_internal::IdEpochType::ID_NEXT_REGION, meta_increment);
-  CreateRegionForSplitInternal(split_from_region_id, new_region_id, meta_increment_tmp);
+  auto status_ret = CreateRegionForSplitInternal(split_from_region_id, new_region_id, meta_increment_tmp);
+  if (!status_ret.ok()) {
+    DINGO_LOG(ERROR) << "SplitRegionWithTaskList create region for split failed, split_from_region_id="
+                     << split_from_region_id << ", split_to_region_id=" << split_to_region_id
+                     << ", errcode=" << status_ret.error_code() << ", errmsg=" << status_ret.error_str();
+    return status_ret;
+  }
+
+  // create task list
+  auto* new_task_list = CreateTaskList(meta_increment);
 
   // build create_region task
   auto* create_region_task = new_task_list->add_tasks();
@@ -1421,13 +1450,11 @@ butil::Status CoordinatorControl::SplitRegionWithTaskList(uint64_t split_from_re
     // send load vector index to store
     for (const auto& peer : split_from_region.definition().peers()) {
       AddLoadVectorIndexTask(new_task_list, peer.store_id(), split_from_region_id, meta_increment);
-      AddLoadVectorIndexTask(new_task_list, peer.store_id(), new_region_id, meta_increment);
     }
 
     // check vector index is ready
     for (const auto& peer : split_from_region.definition().peers()) {
       AddCheckVectorIndexTask(new_task_list, peer.store_id(), split_from_region_id);
-      AddCheckVectorIndexTask(new_task_list, peer.store_id(), new_region_id);
     }
   }
 
@@ -2436,6 +2463,19 @@ void CoordinatorControl::UpdateRegionMapAndStoreOperation(const pb::common::Stor
       need_update_region_definition = true;
     }
 
+    if (region_to_update.definition().raw_range().start_key() !=
+            region_metrics.region_definition().raw_range().start_key() ||
+        region_to_update.definition().raw_range().end_key() !=
+            region_metrics.region_definition().raw_range().end_key()) {
+      DINGO_LOG(INFO) << "region raw_range change region_id = " << region_metrics.id() << " old range = ["
+                      << region_to_update.definition().raw_range().start_key() << ", "
+                      << region_to_update.definition().raw_range().end_key() << ")"
+                      << " new raw_range = [" << region_metrics.region_definition().raw_range().start_key() << ", "
+                      << region_metrics.region_definition().raw_range().end_key() << ")";
+      need_update_region = true;
+      need_update_region_definition = true;
+    }
+
     if (region_to_update.definition().peers_size() != region_metrics.region_definition().peers_size()) {
       DINGO_LOG(INFO) << "region peers size change region_id = " << region_metrics.id()
                       << " old peers size = " << region_to_update.definition().peers_size()
@@ -2592,8 +2632,8 @@ uint64_t CoordinatorControl::UpdateStoreMetrics(const pb::common::StoreMetrics& 
   }
 
   // mbvar store
-  coordinator_bvar_metrics_store_.UpdateStoreBvar(store_metrics.id(), store_metrics.total_capacity(),
-                                                  store_metrics.free_capacity());
+  coordinator_bvar_metrics_store_.UpdateStoreBvar(store_metrics.id(), store_metrics.system_total_capacity(),
+                                                  store_metrics.system_free_capacity());
 
   // use region_metrics_map to update region_map and store_operation
   if (store_metrics.region_metrics_map_size() > 0) {

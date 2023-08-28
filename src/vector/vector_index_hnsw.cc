@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -38,12 +39,33 @@
 #include "proto/common.pb.h"
 #include "proto/error.pb.h"
 #include "vector/vector_index.h"
-#include "vector/vector_index_filter.h"
 #include "vector/vector_index_utils.h"
 
 namespace dingodb {
 
 DEFINE_uint64(hnsw_need_save_count, 10000, "hnsw need save count");
+
+// Filter vecotr id used by region range.
+class HnswRangeFilterFunctor : public hnswlib::BaseFilterFunctor {
+ public:
+  HnswRangeFilterFunctor(std::vector<std::shared_ptr<VectorIndex::FilterFunctor>> filters) : filters_(filters) {}
+  virtual ~HnswRangeFilterFunctor() = default;
+  bool operator()(hnswlib::labeltype id) override {
+    if (filters_.empty()) {
+      return true;
+    }
+    for (const auto& filter : filters_) {
+      if (!filter->Check(id)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+ private:
+  std::vector<std::shared_ptr<VectorIndex::FilterFunctor>> filters_;
+};
 
 /*
  * replacement for the openmp '#pragma omp parallel for' directive
@@ -109,7 +131,6 @@ VectorIndexHnsw::VectorIndexHnsw(uint64_t id, const pb::common::VectorIndexParam
                                  uint64_t save_snapshot_threshold_write_key_num)
     : VectorIndex(id, vector_index_parameter, save_snapshot_threshold_write_key_num) {
   bthread_mutex_init(&mutex_, nullptr);
-  is_online_.store(true);
   hnsw_num_threads_ = std::thread::hardware_concurrency();
 
   if (vector_index_type == pb::common::VectorIndexType::VECTOR_INDEX_TYPE_HNSW) {
@@ -135,7 +156,7 @@ VectorIndexHnsw::VectorIndexHnsw(uint64_t id, const pb::common::VectorIndexParam
 
     hnsw_index_ =
         new hnswlib::HierarchicalNSW<float>(hnsw_space_, hnsw_parameter.max_elements(), hnsw_parameter.nlinks(),
-                                            hnsw_parameter.efconstruction(), 100, true);
+                                            hnsw_parameter.efconstruction(), 100, false);
   } else {
     hnsw_index_ = nullptr;
   }
@@ -155,13 +176,6 @@ butil::Status VectorIndexHnsw::Add(const std::vector<pb::common::VectorWithId>& 
 }
 
 butil::Status VectorIndexHnsw::Upsert(const std::vector<pb::common::VectorWithId>& vector_with_ids) {
-  // check is_online
-  if (!is_online_.load()) {
-    std::string s = fmt::format("vector index is offline, please wait for online");
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(pb::error::Errno::EVECTOR_INDEX_OFFLINE, s);
-  }
-
   if (vector_with_ids.empty()) {
     DINGO_LOG(WARNING) << "upsert vector empty";
     return butil::Status::OK();
@@ -178,6 +192,22 @@ butil::Status VectorIndexHnsw::Upsert(const std::vector<pb::common::VectorWithId
 
   BAIDU_SCOPED_LOCK(mutex_);
 
+  // delete first
+  // {
+  //   std::vector<uint64_t> delete_ids;
+  //   delete_ids.reserve(vector_with_ids.size());
+  //   for (const auto& v : vector_with_ids) {
+  //     delete_ids.push_back(v.id());
+  //   }
+
+  //   try {
+  //     ParallelFor(0, delete_ids.size(), hnsw_num_threads_,
+  //                 [&](size_t row, size_t /*thread_id*/) { hnsw_index_->markDelete(delete_ids[row]); });
+  //     write_key_count += delete_ids.size();
+  //   } catch (std::runtime_error& e) {
+  //   }
+  // }
+
   // Add data to index
   try {
     size_t real_threads = hnsw_num_threads_;
@@ -191,7 +221,7 @@ butil::Status VectorIndexHnsw::Upsert(const std::vector<pb::common::VectorWithId
     if (!normalize_) {
       ParallelFor(0, vector_with_ids.size(), real_threads, [&](size_t row, size_t /*thread_id*/) {
         this->hnsw_index_->addPoint((void*)vector_with_ids[row].vector().float_values().data(),
-                                    vector_with_ids[row].id(), true);
+                                    vector_with_ids[row].id(), false);
       });
     } else {
       std::vector<float> norm_array(real_threads * dimension_);
@@ -201,7 +231,7 @@ butil::Status VectorIndexHnsw::Upsert(const std::vector<pb::common::VectorWithId
         VectorIndexUtils::NormalizeVectorForHnsw((float*)vector_with_ids[row].vector().float_values().data(),
                                                  dimension_, (norm_array.data() + start_idx));
 
-        this->hnsw_index_->addPoint((void*)(norm_array.data() + start_idx), vector_with_ids[row].id(), true);
+        this->hnsw_index_->addPoint((void*)(norm_array.data() + start_idx), vector_with_ids[row].id(), false);
       });
     }
     write_key_count += vector_with_ids.size();
@@ -213,13 +243,6 @@ butil::Status VectorIndexHnsw::Upsert(const std::vector<pb::common::VectorWithId
 }
 
 butil::Status VectorIndexHnsw::Delete(const std::vector<uint64_t>& delete_ids) {
-  // check is_online
-  if (!is_online_.load()) {
-    std::string s = fmt::format("vector index is offline, please wait for online");
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(pb::error::Errno::EVECTOR_INDEX_OFFLINE, s);
-  }
-
   if (delete_ids.empty()) {
     DINGO_LOG(WARNING) << "delete ids is empty";
     return butil::Status::OK();
@@ -268,15 +291,8 @@ butil::Status VectorIndexHnsw::Load(const std::string& path) {
 }
 
 butil::Status VectorIndexHnsw::Search(std::vector<pb::common::VectorWithId> vector_with_ids, uint32_t topk,
-                                      std::vector<pb::index::VectorWithDistanceResult>& results, bool reconstruct,
-                                      const std::vector<uint64_t>& vector_ids) {
-  // check is_online
-  if (!is_online_.load()) {
-    std::string s = fmt::format("vector index is offline, please wait for online");
-    DINGO_LOG(ERROR) << s;
-    return butil::Status(pb::error::Errno::EVECTOR_INDEX_OFFLINE, s);
-  }
-
+                                      std::vector<std::shared_ptr<FilterFunctor>> filters,
+                                      std::vector<pb::index::VectorWithDistanceResult>& results, bool reconstruct) {
   if (vector_with_ids.empty()) {
     DINGO_LOG(WARNING) << "vector_with_ids is empty";
     return butil::Status::OK();
@@ -326,98 +342,134 @@ butil::Status VectorIndexHnsw::Search(std::vector<pb::common::VectorWithId> vect
 
   // Search by parallel
   results.resize(vector_with_ids.size());
-  try {
-    bool enable_filter = (!vector_ids.empty());
+  std::vector<butil::Status> statuses;
+  statuses.resize(vector_with_ids.size(), butil::Status::OK());
 
-    std::unique_ptr<SearchFilterForHnsw> search_filter_for_hnsw_ptr = std::make_unique<SearchFilterForHnsw>(vector_ids);
-    hnswlib::BaseFilterFunctor* is_id_allowed = enable_filter ? search_filter_for_hnsw_ptr.get() : nullptr;
+  std::vector<int> real_topks;
+  real_topks.resize(vector_with_ids.size(), 0);
 
-    if (!normalize_) {
-      ParallelFor(0, vector_with_ids.size(), hnsw_num_threads_, [&, is_id_allowed](size_t row, size_t /*thread_id*/) {
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
-            hnsw_index_->searchKnn(data.get() + dimension_ * row, topk, is_id_allowed);
+  auto rows = vector_with_ids.size();
+  std::unique_ptr<hnswlib::labeltype[]> data_label_ptr = std::make_unique<hnswlib::labeltype[]>(rows * topk);
+  hnswlib::labeltype* data_label = data_label_ptr.get();
 
-        while (!result.empty()) {
-          auto* vector_with_distance = results[row].add_vector_with_distances();
-          vector_with_distance->set_distance(result.top().first);
-          vector_with_distance->set_metric_type(this->vector_index_parameter.hnsw_parameter().metric_type());
+  std::unique_ptr<float[]> data_distance_ptr = std::make_unique<float[]>(rows * topk);
+  float* data_distance = data_distance_ptr.get();
 
-          auto* vector_with_id = vector_with_distance->mutable_vector_with_id();
+  auto lambda_fill_results_function = [&results, this, data_label, data_distance, &real_topks](size_t row, int topk,
+                                                                                               bool reconstruct) {
+    for (int i = 0; i < topk && i < real_topks[row]; i++) {
+      auto* vector_with_distance = results[row].add_vector_with_distances();
+      vector_with_distance->set_distance(data_distance[row * topk + i]);
+      vector_with_distance->set_metric_type(this->vector_index_parameter.hnsw_parameter().metric_type());
 
-          vector_with_id->set_id(result.top().second);
-          vector_with_id->mutable_vector()->set_dimension(dimension_);
-          vector_with_id->mutable_vector()->set_value_type(::dingodb::pb::common::ValueType::FLOAT);
+      auto* vector_with_id = vector_with_distance->mutable_vector_with_id();
 
-          if (reconstruct) {
-            try {
-              std::vector<float> data = hnsw_index_->getDataByLabel<float>(result.top().second);
-              for (auto& value : data) {
-                vector_with_id->mutable_vector()->add_float_values(value);
-              }
-            } catch (std::exception& e) {
-              LOG(ERROR) << "getDataByLabel failed, label: " << result.top().second << " err: " << e.what();
-            }
+      vector_with_id->set_id(data_label[row * topk + i]);
+      vector_with_id->mutable_vector()->set_dimension(dimension_);
+      vector_with_id->mutable_vector()->set_value_type(::dingodb::pb::common::ValueType::FLOAT);
+
+      if (reconstruct) {
+        try {
+          std::vector<float> data = hnsw_index_->getDataByLabel<float>(data_label[row * topk + i]);
+          for (auto& value : data) {
+            vector_with_id->mutable_vector()->add_float_values(value);
           }
-
-          result.pop();
+        } catch (std::exception& e) {
+          std::string s =
+              fmt::format("getDataByLabel failed, label: {}  err: {}", data_label[row * topk + i], e.what());
+          LOG(ERROR) << s;
+          return butil::Status(pb::error::Errno::EINTERNAL, s);
         }
-      });
-    } else {
-      std::vector<float> norm_array(hnsw_num_threads_ * dimension_);
-      ParallelFor(0, vector_with_ids.size(), hnsw_num_threads_, [&, is_id_allowed](size_t row, size_t thread_id) {
-        size_t start_idx = thread_id * dimension_;
-        VectorIndexUtils::NormalizeVectorForHnsw((float*)(data.get() + dimension_ * row), dimension_,
-                                                 (norm_array.data() + start_idx));
-
-        std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
-            hnsw_index_->searchKnn(norm_array.data() + start_idx, topk, is_id_allowed);
-
-        while (!result.empty()) {
-          auto* vector_with_distance = results[row].add_vector_with_distances();
-          vector_with_distance->set_distance(result.top().first);
-          vector_with_distance->set_metric_type(this->vector_index_parameter.hnsw_parameter().metric_type());
-
-          auto* vector_with_id = vector_with_distance->mutable_vector_with_id();
-
-          vector_with_id->set_id(result.top().second);
-          vector_with_id->mutable_vector()->set_dimension(dimension_);
-          vector_with_id->mutable_vector()->set_value_type(::dingodb::pb::common::ValueType::FLOAT);
-
-          // TODO: reconstruct normalized vector or orginal vector
-          // if (reconstruct) {
-          //   try {
-          //     std::vector<float> data = hnsw_index_->getDataByLabel<float>(result.top().second);
-          //     for (auto& value : data) {
-          //       vector_with_id->mutable_vector()->add_float_values(value);
-          //     }
-          //   } catch (std::exception& e) {
-          //     LOG(ERROR) << "getDataByLabel failed, label: " << result.top().second << " err: " << e.what();
-          //   }
-          // }
-
-          result.pop();
-        }
-      });
+      }
     }
-  } catch (std::runtime_error& e) {
-    DINGO_LOG(ERROR) << "parallel search vector failed, error=" << e.what();
-    ret = butil::Status(pb::error::Errno::EINTERNAL, "parallel search vector failed, error=" + std::string(e.what()));
+    return butil::Status::OK();
+  };
+
+  auto lambda_reverse_rse_result_function = [data_label, data_distance, &real_topks](
+                                                std::priority_queue<std::pair<float, hnswlib::labeltype>>& result,
+                                                size_t row, int topk) {
+    if (result.size() != topk) {
+      std::string s = fmt::format(
+          "Cannot return the results in a contigious 2D array. Probably ef or M is too small ignore.  topk : {} "
+          "result.size() : "
+          "{}",
+          topk, result.size());
+      LOG(WARNING)  << s;
+    }
+
+    real_topks[row] = result.size();
+    if (!result.empty()) {
+      for (int i = std::min(topk, real_topks[row]) - 1; i >= 0; i--) {
+        const auto& result_tuple = result.top();
+        data_distance[row * topk + i] = result_tuple.first;
+        data_label[row * topk + i] = result_tuple.second;
+        result.pop();
+      }
+    }
+
+    return butil::Status::OK();
+  };
+
+  std::unique_ptr<HnswRangeFilterFunctor> hnsw_filter_ptr;
+  HnswRangeFilterFunctor* hnsw_filter =
+      filters.empty() ? nullptr
+                      : (hnsw_filter_ptr = std::make_unique<HnswRangeFilterFunctor>(filters), hnsw_filter_ptr.get());
+
+  if (!normalize_) {
+    ParallelFor(0, vector_with_ids.size(), hnsw_num_threads_, [&](size_t row, size_t /*thread_id*/) {
+      std::priority_queue<std::pair<float, hnswlib::labeltype>> result;
+
+      try {
+        result = hnsw_index_->searchKnn(data.get() + dimension_ * row, topk, hnsw_filter);
+      } catch (std::runtime_error& e) {
+        std::string s = fmt::format("parallel search vector failed, error= {}", e.what());
+        LOG(ERROR)  << s;
+        statuses[row] = butil::Status(pb::error::Errno::EINTERNAL, s);
+        return;
+      }
+
+      statuses[row] = lambda_reverse_rse_result_function(result, row, topk);
+      if (statuses[row].ok()) {
+        statuses[row] = lambda_fill_results_function(row, topk, reconstruct);
+      }
+    });
+  } else {  // normalize_
+    std::vector<float> norm_array(hnsw_num_threads_ * dimension_);
+    ParallelFor(0, vector_with_ids.size(), hnsw_num_threads_, [&](size_t row, size_t thread_id) {
+      size_t start_idx = thread_id * dimension_;
+      VectorIndexUtils::NormalizeVectorForHnsw((float*)(data.get() + dimension_ * row), dimension_,  // NOLINT
+                                               (norm_array.data() + start_idx));
+
+      std::priority_queue<std::pair<float, hnswlib::labeltype>> result;
+
+      try {
+        result = hnsw_index_->searchKnn(norm_array.data() + start_idx, topk, hnsw_filter);
+      } catch (std::runtime_error& e) {
+        std::string s = fmt::format("parallel search vector failed, error= {}", e.what());
+        LOG(ERROR)  << s;
+        statuses[row] = butil::Status(pb::error::Errno::EINTERNAL, s);
+        return;
+      }
+
+      statuses[row] = lambda_reverse_rse_result_function(result, row, topk);
+
+      // force  reconstruct false
+      if (statuses[row].ok()) {
+        statuses[row] = lambda_fill_results_function(row, topk, false);
+      }
+    });
+  }
+
+  // check
+  for (const auto& status : statuses) {
+    if (!status.ok()) {
+      DINGO_LOG(ERROR) << status.error_cstr();
+      return status;
+    }
   }
 
   return butil::Status::OK();
 }
-
-butil::Status VectorIndexHnsw::SetOnline() {
-  is_online_.store(true);
-  return butil::Status::OK();
-}
-
-butil::Status VectorIndexHnsw::SetOffline() {
-  is_online_.store(false);
-  return butil::Status::OK();
-}
-
-bool VectorIndexHnsw::IsOnline() { return is_online_.load(); }
 
 void VectorIndexHnsw::LockWrite() { bthread_mutex_lock(&mutex_); }
 
@@ -444,8 +496,8 @@ butil::Status VectorIndexHnsw::NeedToRebuild([[maybe_unused]] bool& need_to_rebu
 butil::Status VectorIndexHnsw::NeedToSave([[maybe_unused]] bool& need_to_save,
                                           [[maybe_unused]] uint64_t last_save_log_behind) {
   if (this->status != pb::common::RegionVectorIndexStatus::VECTOR_INDEX_STATUS_NORMAL) {
-    DINGO_LOG(INFO) << "need_to_save=false: vector index status is not normal, status="
-                    << pb::common::RegionVectorIndexStatus_Name(this->status.load());
+    DINGO_LOG(INFO) << fmt::format("vector index {} need_to_save=false: vector index status is not normal, status={}",
+                                   Id(), pb::common::RegionVectorIndexStatus_Name(this->status.load()));
     need_to_save = false;
     return butil::Status::OK();
   }
@@ -454,36 +506,39 @@ butil::Status VectorIndexHnsw::NeedToSave([[maybe_unused]] bool& need_to_save,
   auto deleted_count = this->hnsw_index_->getDeletedCount();
 
   if (element_count == 0 && deleted_count == 0) {
-    DINGO_LOG(INFO) << "need_to_save=false: element count is 0 and deleted count is 0, element_count=" << element_count
-                    << ", deleted_count=" << deleted_count;
+    DINGO_LOG(INFO) << fmt::format(
+        "vector index {} need_to_save=false: element count is 0 and deleted count is 0, element_count={} "
+        "deleted_count={}",
+        Id(), element_count, deleted_count);
     need_to_save = false;
     return butil::Status::OK();
   }
 
   if (snapshot_log_index.load() == 0) {
-    DINGO_LOG(INFO) << "need_to_save=true: snapshot_log_index is 0";
+    DINGO_LOG(INFO) << fmt::format("vector index {} need_to_save=true: snapshot_log_index is 0", Id());
     need_to_save = true;
     last_save_write_key_count = write_key_count;
     return butil::Status::OK();
   }
 
   if (last_save_log_behind > FLAGS_hnsw_need_save_count) {
-    DINGO_LOG(INFO) << "need_to_save=true: last_save_log_behind=" << last_save_log_behind
-                    << ", FLAGS_hnsw_need_save_count=" << FLAGS_hnsw_need_save_count;
+    DINGO_LOG(INFO) << fmt::format(
+        "vector index {} need_to_save=true: last_save_log_behind={} FLAGS_hnsw_need_save_count={}", Id(),
+        last_save_log_behind, FLAGS_hnsw_need_save_count);
     need_to_save = true;
     last_save_write_key_count = write_key_count;
     return butil::Status::OK();
   }
 
   if ((write_key_count - last_save_write_key_count) >= save_snapshot_threshold_write_key_num) {
-    DINGO_LOG(INFO) << fmt::format("need_to_save=true: write_key_count {}/{}/{}", write_key_count,
+    DINGO_LOG(INFO) << fmt::format("vector index {} need_to_save=true: write_key_count {}/{}/{}", Id(), write_key_count,
                                    last_save_write_key_count, save_snapshot_threshold_write_key_num);
     need_to_save = true;
     last_save_write_key_count = write_key_count;
     return butil::Status::OK();
   }
 
-  DINGO_LOG(INFO) << "need_to_save=false: last_save_log_behind=" << last_save_log_behind
+  DINGO_LOG(INFO) << "vector index " << Id() << " need_to_save=false: last_save_log_behind=" << last_save_log_behind
                   << ", FLAGS_hnsw_need_save_count=" << FLAGS_hnsw_need_save_count
                   << fmt::format(", write_key_count={}/{}/{}", write_key_count, last_save_write_key_count,
                                  save_snapshot_threshold_write_key_num);
@@ -522,11 +577,15 @@ hnswlib::HierarchicalNSW<float>* VectorIndexHnsw::GetHnswIndex() { return this->
 int32_t VectorIndexHnsw::GetDimension() { return this->dimension_; }
 
 butil::Status VectorIndexHnsw::GetCount(uint64_t& count) {
+  // std::unique_lock<std::mutex> lock_table(this->hnsw_index_->label_lookup_lock);
+  // count = this->hnsw_index_->label_lookup_.size();
   count = this->hnsw_index_->getCurrentElementCount();
   return butil::Status::OK();
 }
 
 butil::Status VectorIndexHnsw::GetDeletedCount(uint64_t& deleted_count) {
+  // std::unique_lock<std::mutex> lock_deleted_elements(this->hnsw_index_->deleted_elements_lock);
+  // deleted_count = this->hnsw_index_->deleted_elements.size();
   deleted_count = this->hnsw_index_->getDeletedCount();
   return butil::Status::OK();
 }

@@ -22,6 +22,7 @@
 #include "brpc/channel.h"
 #include "brpc/controller.h"
 #include "bthread/bthread.h"
+#include "bthread/types.h"
 #include "client/client_helper.h"
 #include "client/coordinator_client_function.h"
 #include "client/store_client_function.h"
@@ -90,7 +91,8 @@ DEFINE_int32(table_id, 0, "table id");
 DEFINE_string(table_name, "", "table name");
 DEFINE_string(raft_group, "store_default_test", "raft group");
 DEFINE_int32(partition_num, 1, "table partition num");
-DEFINE_int32(start_id, 1, "start id");
+DEFINE_int32(start_id, 0, "start id");
+DEFINE_int32(end_id, 0, "end id");
 DEFINE_int32(count, 50, "count");
 DEFINE_int32(vector_id, 0, "vector_id");
 DEFINE_int32(topn, 10, "top n");
@@ -106,6 +108,8 @@ DEFINE_int32(limit, 0, "limit");
 DEFINE_bool(is_reverse, false, "is_revers");
 DEFINE_string(scalar_filter_key, "", "Request scalar_filter_key");
 DEFINE_string(scalar_filter_value, "", "Request scalar_filter_value");
+DEFINE_string(scalar_filter_key2, "", "Request scalar_filter_key");
+DEFINE_string(scalar_filter_value2, "", "Request scalar_filter_value");
 DEFINE_int32(ttl, 0, "ttl");
 DEFINE_bool(auto_split, false, "auto split");
 
@@ -131,6 +135,7 @@ DEFINE_uint32(max_watch_count, 10, "max_watch_count");
 DEFINE_bool(with_vector_ids, false, "Search vector with vector ids list default false");
 DEFINE_bool(with_scalar_pre_filter, false, "Search vector with scalar data pre filter");
 DEFINE_bool(with_scalar_post_filter, false, "Search vector with scalar data post filter");
+DEFINE_uint32(vector_ids_count, 100, "vector ids count");
 
 DEFINE_string(lock_name, "", "Request lock_name");
 DEFINE_string(client_uuid, "", "Request client_uuid");
@@ -313,19 +318,34 @@ void Sender(std::shared_ptr<client::Context> ctx, const std::string& method, int
     // Vector operation
     else if (method == "VectorSearch") {
       client::SendVectorSearch(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_vector_id, FLAGS_topn);
+    } else if (method == "VectorSearchDebug") {
+      client::SendVectorSearchDebug(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_vector_id,
+                                    FLAGS_topn, FLAGS_batch_count, FLAGS_key, FLAGS_value);
     } else if (method == "VectorBatchSearch") {
       client::SendVectorBatchSearch(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_vector_id,
                                     FLAGS_topn, FLAGS_batch_count);
     } else if (method == "VectorBatchQuery") {
       client::SendVectorBatchQuery(ctx->store_interaction, FLAGS_region_id, {static_cast<uint64_t>(FLAGS_vector_id)});
     } else if (method == "VectorScanQuery") {
-      client::SendVectorScanQuery(ctx->store_interaction, FLAGS_region_id, FLAGS_start_id, FLAGS_limit,
+      client::SendVectorScanQuery(ctx->store_interaction, FLAGS_region_id, FLAGS_start_id, FLAGS_end_id, FLAGS_limit,
                                   FLAGS_is_reverse);
     } else if (method == "VectorGetRegionMetrics") {
       client::SendVectorGetRegionMetrics(ctx->store_interaction, FLAGS_region_id);
     } else if (method == "VectorAdd") {
-      client::SendVectorAdd(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_start_id, FLAGS_count,
-                            FLAGS_step_count);
+      ctx->table_id = FLAGS_table_id;
+      ctx->region_id = FLAGS_region_id;
+      ctx->dimension = FLAGS_dimension;
+      ctx->start_id = FLAGS_start_id;
+      ctx->count = FLAGS_count;
+      ctx->step_count = FLAGS_step_count;
+      ctx->with_scalar = FLAGS_with_scalar;
+      ctx->with_table = FLAGS_with_table;
+
+      if (ctx->table_id > 0) {
+        client::SendVectorAddRetry(ctx);
+      } else {
+        client::SendVectorAdd(ctx);
+      }
     } else if (method == "VectorDelete") {
       client::SendVectorDelete(ctx->store_interaction, FLAGS_region_id, FLAGS_start_id, FLAGS_count);
     } else if (method == "VectorGetMaxId") {
@@ -335,15 +355,23 @@ void Sender(std::shared_ptr<client::Context> ctx, const std::string& method, int
     } else if (method == "VectorAddBatch") {
       client::SendVectorAddBatch(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_count,
                                  FLAGS_step_count, FLAGS_start_id, FLAGS_vector_index_add_cost_file);
+    } else if (method == "VectorAddBatchDebug") {
+      client::SendVectorAddBatchDebug(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_count,
+                                      FLAGS_step_count, FLAGS_start_id, FLAGS_vector_index_add_cost_file);
     } else if (method == "VectorCalcDistance") {
       client::SendVectorCalcDistance(ctx->store_interaction, FLAGS_region_id, FLAGS_dimension, FLAGS_alg_type,
                                      FLAGS_metric_type, FLAGS_left_vector_size, FLAGS_right_vector_size,
                                      FLAGS_is_return_normlize);
-    }
 
-    // Test
-    else if (method == "TestBatchPut") {
-      client::TestBatchPut(ctx->store_interaction, FLAGS_region_id, FLAGS_thread_num, FLAGS_req_num, FLAGS_prefix);
+      // Test
+    } else if (method == "TestBatchPut") {
+      ctx->table_id = FLAGS_table_id;
+      ctx->region_id = FLAGS_region_id;
+      ctx->thread_num = FLAGS_thread_num;
+      ctx->req_num = FLAGS_req_num;
+      ctx->prefix = FLAGS_prefix;
+
+      client::TestBatchPut(ctx);
     } else if (method == "TestBatchPutGet") {
       client::TestBatchPutGet(ctx->store_interaction, FLAGS_region_id, FLAGS_thread_num, FLAGS_req_num, FLAGS_prefix);
     } else if (method == "TestRegionLifecycle") {
@@ -366,6 +394,20 @@ void Sender(std::shared_ptr<client::Context> ctx, const std::string& method, int
     else if (method == "AutoDropTable") {
       ctx->req_num = FLAGS_req_num;
       client::AutoDropTable(ctx);
+    }
+    // Check table range
+    else if (method == "CheckTableDistribution") {
+      ctx->table_id = FLAGS_table_id;
+      for (;;) {
+        client::CheckTableDistribution(ctx);
+        bthread_usleep(1000 * 1000);
+      }
+    } else if (method == "CheckIndexDistribution") {
+      ctx->table_id = FLAGS_table_id;
+      for (;;) {
+        client::CheckIndexDistribution(ctx);
+        bthread_usleep(1000 * 1000);
+      }
     }
 
     // illegal method

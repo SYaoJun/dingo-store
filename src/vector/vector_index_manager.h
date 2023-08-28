@@ -17,72 +17,74 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "butil/status.h"
 #include "common/safe_map.h"
 #include "meta/store_meta_manager.h"
-#include "meta/transform_kv_able.h"
 #include "proto/common.pb.h"
 #include "vector/vector_index.h"
 #include "vector/vector_index_snapshot.h"
 
 namespace dingodb {
 
-class VectorIndexManager : public TransformKvAble {
+class VectorIndexManager {
  public:
   VectorIndexManager(std::shared_ptr<RawEngine> raw_engine, std::shared_ptr<MetaReader> meta_reader,
                      std::shared_ptr<MetaWriter> meta_writer)
-      : TransformKvAble(Constant::kVectorIndexApplyLogPrefix),
-        raw_engine_(raw_engine),
-        meta_reader_(meta_reader),
-        meta_writer_(meta_writer) {
+      : raw_engine_(raw_engine), meta_reader_(meta_reader), meta_writer_(meta_writer) {
     vector_index_snapshot_manager_ = std::make_shared<VectorIndexSnapshotManager>();
     vector_indexs_.Init(1000);
   }
 
-  ~VectorIndexManager() override = default;
+  ~VectorIndexManager() = default;
 
   bool Init(std::vector<store::RegionPtr> regions);
 
-  bool AddVectorIndex(uint64_t region_id, const pb::common::IndexParameter& index_parameter);
+  bool AddVectorIndex(uint64_t vector_index_id, const pb::common::IndexParameter& index_parameter);
 
-  void DeleteVectorIndex(uint64_t region_id);
+  void DeleteVectorIndex(uint64_t vector_index_id);
 
-  std::shared_ptr<VectorIndex> GetVectorIndex(uint64_t region_id);
+  std::shared_ptr<VectorIndex> GetVectorIndex(uint64_t vector_index_id);
+  std::shared_ptr<VectorIndex> GetVectorIndex(store::RegionPtr region);
   std::vector<std::shared_ptr<VectorIndex>> GetAllVectorIndex();
 
   // Load vector index for already exist vector index at bootstrap.
   // Priority load from snapshot, if snapshot not exist then load from rocksdb.
+  butil::Status LoadOrBuildVectorIndex(uint64_t region_id);
   butil::Status LoadOrBuildVectorIndex(store::RegionPtr region);
+  butil::Status ParallelLoadOrBuildVectorIndex(std::vector<store::RegionPtr> regions, int concurrency);
 
   // Save vector index snapshot.
   butil::Status SaveVectorIndex(std::shared_ptr<VectorIndex> vector_index);
 
-  // check if status is legal for rebuild
-  butil::Status CheckAndSetRebuildStatus(store::RegionPtr region, bool is_initial_build);
-
   // Invoke when server runing.
-  butil::Status RebuildVectorIndex(store::RegionPtr region, bool need_save = true, bool is_initial_build = false);
+  butil::Status RebuildVectorIndex(store::RegionPtr region, bool need_save = true);
+  butil::Status AsyncRebuildVectorIndex(store::RegionPtr region, bool need_save = true);
 
   // Update vector index apply log index.
-  void UpdateApplyLogIndex(std::shared_ptr<VectorIndex> vector_index, uint64_t log_index);
-  void UpdateApplyLogIndex(uint64_t region_id, uint64_t log_index);
+  void UpdateApplyLogId(std::shared_ptr<VectorIndex> vector_index, uint64_t log_index);
+  void UpdateApplyLogId(uint64_t vector_index_id, uint64_t log_index);
 
   // Update vector index snapshot log index.
-  void UpdateSnapshotLogIndex(std::shared_ptr<VectorIndex> vector_index, uint64_t log_index);
-  void UpdateSnapshotLogIndex(uint64_t region_id, uint64_t log_index);
+  void UpdateSnapshotLogId(std::shared_ptr<VectorIndex> vector_index, uint64_t log_index);
+  void UpdateSnapshotLogId(uint64_t vector_index_id, uint64_t log_index);
 
   butil::Status ScrubVectorIndex();
 
   std::shared_ptr<VectorIndexSnapshotManager> GetVectorIndexSnapshotManager() { return vector_index_snapshot_manager_; }
 
- private:
-  std::shared_ptr<pb::common::KeyValue> TransformToKv(std::any obj) override;
-  void TransformFromKv(const std::vector<pb::common::KeyValue>& kvs) override;
-  butil::Status GetVectorIndexLogIndex(uint64_t region_id, uint64_t& snapshot_log_index, uint64_t& apply_log_index);
+  void SaveApplyLogId(uint64_t vector_index_id, uint64_t apply_log_id);
+  butil::Status LoadApplyLogId(uint64_t vector_index_id, uint64_t& apply_log_id);
+  void SaveSnapshotLogId(uint64_t vector_index_id, uint64_t snapshot_log_id);
+  butil::Status LoadSnapshotLogId(uint64_t vector_index_id, uint64_t& snapshot_log_id);
 
-  bool AddVectorIndex(uint64_t region_id, std::shared_ptr<VectorIndex> vector_index);
+ private:
+  butil::Status GetVectorIndexLogIndex(uint64_t vector_index_id, uint64_t& snapshot_log_index,
+                                       uint64_t& apply_log_index);
+
+  bool AddVectorIndex(std::shared_ptr<VectorIndex> vector_index, bool force = true);
 
   // Build vector index with original all data(store rocksdb).
   // Invoke when server starting.
@@ -101,7 +103,7 @@ class VectorIndexManager : public TransformKvAble {
   std::shared_ptr<MetaWriter> meta_writer_;
 
   std::shared_ptr<RawEngine> raw_engine_;
-  // region_id: vector_index
+  // vector_index_id: vector_index
   DingoSafeMap<uint64_t, std::shared_ptr<VectorIndex>> vector_indexs_;
 
   // vector index snapshot manager

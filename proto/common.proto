@@ -86,8 +86,8 @@ message VectorTableData {
 message VectorWithId {
   uint64 id = 1;
   Vector vector = 2;  // vector data
-  VectorScalardata scalar_data =
-      3;                           // scalar data of this vector, key: scalar key, value: scalar value data. meta data.
+  // scalar data of this vector, key: scalar key, value: scalar value data. meta data.
+  VectorScalardata scalar_data = 3;
   VectorTableData table_data = 4;  // table data of this vector, only SQL can use this field
 }
 
@@ -187,6 +187,7 @@ enum RegionVectorIndexStatus {
   VECTOR_INDEX_STATUS_SNAPSHOTTING = 5;  // The index is being snapshotted.
   VECTOR_INDEX_STATUS_REPLAYING = 6;     // The index is replaying wal.
   VECTOR_INDEX_STATUS_ERROR = 10;        // The index is in an error state.
+  VECTOR_INDEX_STATUS_DELETE = 11;       // The index is delete state.
 }
 
 enum ReplicaStatus {
@@ -520,6 +521,12 @@ message VectorSchema {
     LONG = 3;
     DOUBLE = 4;
     STRING = 5;
+    BOOLLIST = 6;
+    INTEGERLIST = 7;
+    FLOATLIST = 8;
+    LONGLIST = 9;
+    DOUBLELIST = 10 ;
+    STRINGLIST = 11;
   };
 
   // type of data
@@ -575,12 +582,6 @@ message VectorSearchParameter {
     SearchHNSWParam hnsw = 14;
     SearchDiskAnnParam diskann = 15;
   }
-
-  // Whether to use scalar filtering.
-  // This is a switch to enable or disable filtering.
-  // @Deprecated This field will be deprecated in the near future.
-  // @Deprecated Please use vector_filter and vector_query_type instead.
-  bool use_scalar_filter = 20;
 
   // filter source
   VectorFilter vector_filter = 21;
@@ -733,15 +734,26 @@ message RegionMetrics {
 
 // StoreMetrics
 message StoreMetrics {
-  uint64 id = 1;              // store id
-  uint64 total_capacity = 2;  // total capacity of this store
-  uint64 free_capacity = 3;   // free capacity of this store
+  uint64 id = 1;                     // store id
+  uint64 system_total_capacity = 2;  // total capacity of this store
+  uint64 system_free_capacity = 3;   // free capacity of this store
+
+  uint64 system_cpu_usage = 4;     // cpu usage of this store process
+  uint64 system_total_memory = 5;  // total memory of the host this store process running on
+  uint64 system_free_memory = 6;   // total free memory of the host this store process running on
+  uint64 system_total_swap = 7;    // total swap of the host this store process running on
+  uint64 system_free_swap = 8;     // total free swap of the host this store process running on
+  uint64 system_io_util = 9;       // io utilization of the host this store process running on , NOT IMPLEMENTED
+
+  uint64 process_used_cpu = 21;       // cpu usage of this store process, this value / 100 is the real cpu usage percent
+  uint64 process_used_memory = 22;    // total used memory of this store process
+  uint64 process_used_capacity = 23;  // free capacity of this store , NOT IMPLEMENTED
 
   // the key of the map is region_id,  the value is RegionMetrics
   // this map contains all region's metrics include follower on this store
-  map<uint64, dingodb.pb.common.RegionMetrics> region_metrics_map = 4;
+  map<uint64, dingodb.pb.common.RegionMetrics> region_metrics_map = 40;
   bool is_partial_region_metrics =
-      5;  // true: region_metrics_map only contain partial region metrics, false: contain full region metrics
+      41;  // true: region_metrics_map only contain partial region metrics, false: contain full region metrics
 }
 
 // CoordinatorServiceType

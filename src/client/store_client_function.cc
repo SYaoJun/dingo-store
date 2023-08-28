@@ -36,6 +36,7 @@
 #include "glog/logging.h"
 #include "proto/common.pb.h"
 #include "proto/index.pb.h"
+#include "serial/buf.h"
 
 const int kBatchSize = 1000;
 
@@ -46,9 +47,12 @@ DECLARE_bool(with_table);
 DECLARE_bool(print_vector_search_delay);
 DECLARE_string(scalar_filter_key);
 DECLARE_string(scalar_filter_value);
+DECLARE_string(scalar_filter_key2);
+DECLARE_string(scalar_filter_value2);
 DECLARE_bool(with_vector_ids);
 DECLARE_bool(with_scalar_pre_filter);
 DECLARE_bool(with_scalar_post_filter);
+DECLARE_uint32(vector_ids_count);
 
 namespace client {
 
@@ -112,6 +116,144 @@ inline void ParallelFor(size_t start, size_t end, size_t num_threads, Function f
     }
   }
 }
+
+// ============================== meta service ===========================
+
+dingodb::pb::meta::TableRange SendGetTableRange(ServerInteractionPtr interaction, uint64_t table_id) {
+  dingodb::pb::meta::GetTableRangeRequest request;
+  dingodb::pb::meta::GetTableRangeResponse response;
+
+  auto* mut_table_id = request.mutable_table_id();
+  mut_table_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_TABLE);
+  mut_table_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
+  mut_table_id->set_entity_id(table_id);
+
+  interaction->SendRequest("MetaService", "GetTableRange", request, response);
+
+  return response.table_range();
+}
+
+dingodb::pb::meta::IndexRange SendGetIndexRange(ServerInteractionPtr interaction, uint64_t table_id) {
+  dingodb::pb::meta::GetIndexRangeRequest request;
+  dingodb::pb::meta::GetIndexRangeResponse response;
+
+  auto* mut_index_id = request.mutable_index_id();
+  mut_index_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_TABLE);
+  mut_index_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
+  mut_index_id->set_entity_id(table_id);
+
+  interaction->SendRequest("MetaService", "GetIndexRange", request, response);
+
+  return response.index_range();
+}
+
+std::vector<uint64_t> SendGetTablesBySchema(ServerInteractionPtr interaction) {
+  dingodb::pb::meta::GetTablesBySchemaRequest request;
+  dingodb::pb::meta::GetTablesBySchemaResponse response;
+
+  auto* schema_id = request.mutable_schema_id();
+  schema_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_SCHEMA);
+  schema_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::ROOT_SCHEMA);
+  schema_id->set_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
+
+  interaction->SendRequest("MetaService", "GetTablesBySchema", request, response);
+
+  std::vector<uint64_t> table_ids;
+  for (const auto& id : response.table_definition_with_ids()) {
+    table_ids.push_back(id.table_id().entity_id());
+  }
+
+  return table_ids;
+}
+
+dingodb::pb::meta::CreateTableRequest BuildCreateTableRequest(const std::string& table_name, int partition_num) {
+  dingodb::pb::meta::CreateTableRequest request;
+
+  auto* schema_id = request.mutable_schema_id();
+  schema_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_SCHEMA);
+  schema_id->set_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
+  schema_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::ROOT_SCHEMA);
+
+  // string name = 1;
+  auto* table_definition = request.mutable_table_definition();
+  table_definition->set_name(table_name);
+
+  // repeated ColumnDefinition columns = 2;
+  for (int i = 0; i < 3; i++) {
+    auto* column = table_definition->add_columns();
+    std::string column_name("test_columen_");
+    column_name.append(std::to_string(i));
+    column->set_name(column_name);
+    column->set_sql_type("INT");
+    column->set_element_type("INT");
+    column->set_precision(100);
+    column->set_nullable(false);
+    column->set_indexofkey(7);
+    column->set_has_default_val(false);
+    column->set_default_val("0");
+  }
+
+  table_definition->set_version(1);
+  table_definition->set_ttl(0);
+  table_definition->set_engine(::dingodb::pb::common::Engine::ENG_ROCKSDB);
+  auto* prop = table_definition->mutable_properties();
+  (*prop)["test property"] = "test_property_value";
+
+  auto* partition_rule = table_definition->mutable_table_partition();
+  auto* part_column = partition_rule->add_columns();
+  part_column->assign("test_part_column");
+  auto* range_partition = partition_rule->mutable_range_partition();
+
+  for (int i = 0; i < partition_num; i++) {
+    auto* part_range = range_partition->add_ranges();
+    auto* part_range_start = part_range->mutable_start_key();
+    part_range_start->assign(std::to_string(i * 100));
+    auto* part_range_end = part_range->mutable_end_key();
+    part_range_end->assign(std::to_string((i + 1) * 100));
+  }
+
+  return request;
+}
+
+uint64_t SendCreateTable(ServerInteractionPtr interaction, const std::string& table_name, int partition_num) {
+  auto request = BuildCreateTableRequest(table_name, partition_num);
+
+  dingodb::pb::meta::CreateTableResponse response;
+  interaction->SendRequest("MetaService", "CreateTable", request, response);
+
+  DINGO_LOG(INFO) << "response=" << response.DebugString();
+  return response.table_id().entity_id();
+}
+
+void SendDropTable(ServerInteractionPtr interaction, uint64_t table_id) {
+  dingodb::pb::meta::DropTableRequest request;
+  dingodb::pb::meta::DropTableResponse response;
+
+  auto* mut_table_id = request.mutable_table_id();
+  mut_table_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_TABLE);
+  mut_table_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
+  mut_table_id->set_entity_id(table_id);
+
+  interaction->SendRequest("MetaService", "DropTable", request, response);
+}
+
+uint64_t SendGetTableByName(ServerInteractionPtr interaction, const std::string& table_name) {
+  dingodb::pb::meta::GetTableByNameRequest request;
+  dingodb::pb::meta::GetTableByNameResponse response;
+
+  auto* schema_id = request.mutable_schema_id();
+  schema_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_SCHEMA);
+  schema_id->set_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
+  schema_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::ROOT_SCHEMA);
+
+  request.set_table_name(table_name);
+
+  interaction->SendRequest("MetaService", "GetTableByName", request, response);
+
+  return response.table_definition_with_id().table_id().entity_id();
+}
+
+// ============================== meta service ===========================
 
 void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint64_t vector_id,
                       uint32_t topn) {
@@ -191,7 +333,7 @@ void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint
       std::cout << id << " ";
     }
     std::cout << "]";
-    std::cout << std::endl;
+    std::cout << '\n';
   }
 
   if (FLAGS_with_scalar_pre_filter) {
@@ -248,7 +390,7 @@ void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint
       std::cout << id << " ";
     }
     std::cout << "]";
-    std::cout << std::endl;
+    std::cout << '\n';
 
     std::vector<uint64_t> result_vt_ids;
     for (const auto& vector_with_distance_result : response.batch_results()) {
@@ -259,24 +401,24 @@ void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint
     }
 
     if (result_vt_ids.empty()) {
-      std::cout << "result_vt_ids : empty" << std::endl;
+      std::cout << "result_vt_ids : empty" << '\n';
     } else {
       std::cout << "result_vt_ids : " << result_vt_ids.size() << " [ ";
       for (auto id : result_vt_ids) {
         std::cout << id << " ";
       }
       std::cout << "]";
-      std::cout << std::endl;
+      std::cout << '\n';
     }
 
     for (auto id : result_vt_ids) {
       auto iter = std::find(vt_ids.begin(), vt_ids.end(), id);
       if (iter == vt_ids.end()) {
-        std::cout << "result_vector_ids not all in vector_ids" << std::endl;
+        std::cout << "result_vector_ids not all in vector_ids" << '\n';
         return;
       }
     }
-    std::cout << "result_vector_ids  all in vector_ids" << std::endl;
+    std::cout << "result_vector_ids  all in vector_ids" << '\n';
   }
 
   if (FLAGS_with_scalar_pre_filter || FLAGS_with_scalar_post_filter) {
@@ -294,7 +436,7 @@ void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint
         std::cout << id << " ";
       }
       std::cout << "]";
-      std::cout << std::endl;
+      std::cout << '\n';
     };
 
     lambda_print_result_vector_function("before sort result_vt_ids");
@@ -303,6 +445,226 @@ void SendVectorSearch(ServerInteractionPtr interaction, uint64_t region_id, uint
 
     lambda_print_result_vector_function("after  sort result_vt_ids");
   }
+}
+
+void SendVectorSearchDebug(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension,
+                           uint64_t start_vector_id, uint32_t topn, uint32_t batch_count, const std::string& key,
+                           const std::string& value) {
+  dingodb::pb::index::VectorSearchDebugRequest request;
+  dingodb::pb::index::VectorSearchDebugResponse response;
+
+  request.set_region_id(region_id);
+
+  if (region_id == 0) {
+    DINGO_LOG(ERROR) << "region_id is 0";
+    return;
+  }
+
+  if (dimension == 0) {
+    DINGO_LOG(ERROR) << "dimension is 0";
+    return;
+  }
+
+  if (topn == 0) {
+    DINGO_LOG(ERROR) << "topn is 0";
+    return;
+  }
+
+  if (batch_count == 0) {
+    DINGO_LOG(ERROR) << "batch_count is 0";
+    return;
+  }
+
+  if (start_vector_id > 0) {
+    for (int count = 0; count < batch_count; count++) {
+      auto* add_vector_with_id = request.add_vector_with_ids();
+      add_vector_with_id->set_id(start_vector_id + count);
+    }
+  } else {
+    std::random_device seed;
+    std::ranlux48 engine(seed());
+    std::uniform_int_distribution<> distrib(0, 100);
+
+    for (int count = 0; count < batch_count; count++) {
+      auto* vector = request.add_vector_with_ids()->mutable_vector();
+      for (int i = 0; i < dimension; i++) {
+        auto random = static_cast<double>(distrib(engine)) / 10.123;
+        vector->add_float_values(random);
+      }
+    }
+
+    request.mutable_parameter()->set_top_n(topn);
+  }
+
+  if (FLAGS_without_vector) {
+    request.mutable_parameter()->set_without_vector_data(true);
+  }
+
+  if (FLAGS_with_scalar) {
+    request.mutable_parameter()->set_with_scalar_data(true);
+  }
+
+  if (FLAGS_with_table) {
+    request.mutable_parameter()->set_with_table_data(true);
+  }
+
+  if (!FLAGS_key.empty()) {
+    auto* key = request.mutable_parameter()->mutable_selected_keys()->Add();
+    key->assign(FLAGS_key);
+  }
+
+  std::vector<uint64_t> vt_ids;
+  if (FLAGS_with_vector_ids) {
+    request.mutable_parameter()->set_vector_filter(::dingodb::pb::common::VectorFilter::VECTOR_ID_FILTER);
+    request.mutable_parameter()->set_vector_filter_type(::dingodb::pb::common::VectorFilterType::QUERY_PRE);
+
+    for (int i = 0; i < FLAGS_vector_ids_count; i++) {
+      std::random_device seed;
+      std::ranlux48 engine(seed());
+
+      std::uniform_int_distribution<> distrib(1, 1000000ULL);
+      auto random = distrib(engine);
+
+      vt_ids.push_back(random);
+    }
+
+    sort(vt_ids.begin(), vt_ids.end());
+    vt_ids.erase(std::unique(vt_ids.begin(), vt_ids.end()), vt_ids.end());
+
+    for (auto id : vt_ids) {
+      request.mutable_parameter()->add_vector_ids(id);
+    }
+
+    std::cout << "vector_ids : " << request.parameter().vector_ids().size() << " [ ";
+
+    for (auto id : request.parameter().vector_ids()) {
+      std::cout << id << " ";
+    }
+    std::cout << "]";
+    std::cout << std::endl;
+  }
+
+  if (FLAGS_with_scalar_pre_filter) {
+    request.mutable_parameter()->set_vector_filter(::dingodb::pb::common::VectorFilter::SCALAR_FILTER);
+    request.mutable_parameter()->set_vector_filter_type(::dingodb::pb::common::VectorFilterType::QUERY_PRE);
+
+    for (uint32_t m = 0; m < batch_count; m++) {
+      dingodb::pb::common::VectorWithId* vector_with_id = request.mutable_vector_with_ids(m);
+
+      ::dingodb::pb::common::ScalarValue scalar_value;
+      scalar_value.set_field_type(::dingodb::pb::common::ScalarFieldType::STRING);
+      ::dingodb::pb::common::ScalarField* field = scalar_value.add_fields();
+      field->set_string_data(value);
+
+      vector_with_id->mutable_scalar_data()->mutable_scalar_data()->insert({key, scalar_value});
+    }
+  }
+
+  if (FLAGS_with_scalar_post_filter) {
+    request.mutable_parameter()->set_vector_filter(::dingodb::pb::common::VectorFilter::SCALAR_FILTER);
+    request.mutable_parameter()->set_vector_filter_type(::dingodb::pb::common::VectorFilterType::QUERY_POST);
+
+    for (uint32_t m = 0; m < batch_count; m++) {
+      dingodb::pb::common::VectorWithId* vector_with_id = request.mutable_vector_with_ids(m);
+
+      ::dingodb::pb::common::ScalarValue scalar_value;
+      scalar_value.set_field_type(::dingodb::pb::common::ScalarFieldType::STRING);
+      ::dingodb::pb::common::ScalarField* field = scalar_value.add_fields();
+      field->set_string_data(value);
+
+      vector_with_id->mutable_scalar_data()->mutable_scalar_data()->insert({key, scalar_value});
+    }
+  }
+
+  if (FLAGS_print_vector_search_delay) {
+    auto start = std::chrono::steady_clock::now();
+    interaction->SendRequest("IndexService", "VectorSearchDebug", request, response);
+    auto end = std::chrono::steady_clock::now();
+    auto diff = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    DINGO_LOG(INFO) << fmt::format("SendVectorSearchDebug  span: {} (us)", diff);
+
+  } else {
+    interaction->SendRequest("IndexService", "VectorSearchDebug", request, response);
+  }
+
+  DINGO_LOG(INFO) << "VectorSearchDebug response: " << response.DebugString();
+
+  DINGO_LOG(INFO) << "VectorSearchDebug response, batch_result_size: " << response.batch_results_size();
+  for (const auto& batch_result : response.batch_results()) {
+    DINGO_LOG(INFO) << "VectorSearchDebug response, batch_result_dist_size: "
+                    << batch_result.vector_with_distances_size();
+  }
+
+#if 0
+  // match compare
+  if (FLAGS_with_vector_ids) {
+    std::cout << "vector_ids : " << request.parameter().vector_ids().size() << " [ ";
+
+    for (auto id : request.parameter().vector_ids()) {
+      std::cout << id << " ";
+    }
+    std::cout << "]";
+    std::cout << std::endl;
+
+    std::cout << "response.batch_results() size : " << response.batch_results().size() << std::endl;
+
+    for (const auto& vector_with_distance_result : response.batch_results()) {
+      std::vector<uint64_t> result_vt_ids;
+      for (const auto& vector_with_distance : vector_with_distance_result.vector_with_distances()) {
+        auto id = vector_with_distance.vector_with_id().id();
+        result_vt_ids.push_back(id);
+      }
+
+      if (result_vt_ids.empty()) {
+        std::cout << "result_vt_ids : empty" << std::endl;
+      } else {
+        std::cout << "result_vt_ids : " << result_vt_ids.size() << " [ ";
+        for (auto id : result_vt_ids) {
+          std::cout << id << " ";
+        }
+        std::cout << "]";
+        std::cout << std::endl;
+      }
+
+      for (auto id : result_vt_ids) {
+        auto iter = std::find(vt_ids.begin(), vt_ids.end(), id);
+        if (iter == vt_ids.end()) {
+          std::cout << "result_vector_ids not all in vector_ids" << std::endl;
+          return;
+        }
+      }
+      std::cout << "result_vector_ids  all in vector_ids" << std::endl;
+    }
+  }
+
+  if (FLAGS_with_scalar_pre_filter) {
+    for (const auto& vector_with_distance_result : response.batch_results()) {
+      std::vector<uint64_t> result_vt_ids;
+      for (const auto& vector_with_distance : vector_with_distance_result.vector_with_distances()) {
+        auto id = vector_with_distance.vector_with_id().id();
+        result_vt_ids.push_back(id);
+      }
+
+      auto lambda_print_result_vector_function = [&result_vt_ids](const std::string& name) {
+        std::cout << name << ": " << result_vt_ids.size() << " [ ";
+        for (auto id : result_vt_ids) {
+          std::cout << id << " ";
+        }
+        std::cout << "]";
+        std::cout << std::endl;
+      };
+
+      lambda_print_result_vector_function("before sort result_vt_ids");
+
+      std::sort(result_vt_ids.begin(), result_vt_ids.end());
+
+      lambda_print_result_vector_function("after  sort result_vt_ids");
+
+      std::cout << std::endl;
+    }
+  }
+#endif
 }
 
 void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint64_t vector_id,
@@ -395,7 +757,7 @@ void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id,
       std::cout << id << " ";
     }
     std::cout << "]";
-    std::cout << std::endl;
+    std::cout << '\n';
   }
 
   if (FLAGS_with_scalar_pre_filter) {
@@ -443,9 +805,9 @@ void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id,
       std::cout << id << " ";
     }
     std::cout << "]";
-    std::cout << std::endl;
+    std::cout << '\n';
 
-    std::cout << "response.batch_results() size : " << response.batch_results().size() << std::endl;
+    std::cout << "response.batch_results() size : " << response.batch_results().size() << '\n';
 
     for (const auto& vector_with_distance_result : response.batch_results()) {
       std::vector<uint64_t> result_vt_ids;
@@ -455,24 +817,24 @@ void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id,
       }
 
       if (result_vt_ids.empty()) {
-        std::cout << "result_vt_ids : empty" << std::endl;
+        std::cout << "result_vt_ids : empty" << '\n';
       } else {
         std::cout << "result_vt_ids : " << result_vt_ids.size() << " [ ";
         for (auto id : result_vt_ids) {
           std::cout << id << " ";
         }
         std::cout << "]";
-        std::cout << std::endl;
+        std::cout << '\n';
       }
 
       for (auto id : result_vt_ids) {
         auto iter = std::find(vt_ids.begin(), vt_ids.end(), id);
         if (iter == vt_ids.end()) {
-          std::cout << "result_vector_ids not all in vector_ids" << std::endl;
+          std::cout << "result_vector_ids not all in vector_ids" << '\n';
           return;
         }
       }
-      std::cout << "result_vector_ids  all in vector_ids" << std::endl;
+      std::cout << "result_vector_ids  all in vector_ids" << '\n';
     }
   }
 
@@ -490,7 +852,7 @@ void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id,
           std::cout << id << " ";
         }
         std::cout << "]";
-        std::cout << std::endl;
+        std::cout << '\n';
       };
 
       lambda_print_result_vector_function("before sort result_vt_ids");
@@ -499,7 +861,7 @@ void SendVectorBatchSearch(ServerInteractionPtr interaction, uint64_t region_id,
 
       lambda_print_result_vector_function("after  sort result_vt_ids");
 
-      std::cout << std::endl;
+      std::cout << '\n';
     }
   }
 }
@@ -535,13 +897,14 @@ void SendVectorBatchQuery(ServerInteractionPtr interaction, uint64_t region_id, 
   DINGO_LOG(INFO) << "VectorBatchQuery response: " << response.DebugString();
 }
 
-void SendVectorScanQuery(ServerInteractionPtr interaction, uint64_t region_id, uint64_t start_id, uint64_t limit,
-                         bool is_reverse) {
+void SendVectorScanQuery(ServerInteractionPtr interaction, uint64_t region_id, uint64_t start_id, uint64_t end_id,
+                         uint64_t limit, bool is_reverse) {
   dingodb::pb::index::VectorScanQueryRequest request;
   dingodb::pb::index::VectorScanQueryResponse response;
 
   request.set_region_id(region_id);
   request.set_vector_id_start(start_id);
+  request.set_vector_id_end(end_id);
 
   if (limit > 0) {
     request.set_max_scan_count(limit);
@@ -581,6 +944,19 @@ void SendVectorScanQuery(ServerInteractionPtr interaction, uint64_t region_id, u
                     << " scalar_filter_value: " << FLAGS_scalar_filter_value;
   }
 
+  if (!FLAGS_scalar_filter_key2.empty()) {
+    auto* scalar_data = request.mutable_scalar_for_filter()->mutable_scalar_data();
+    dingodb::pb::common::ScalarValue scalar_value;
+    scalar_value.set_field_type(::dingodb::pb::common::ScalarFieldType::STRING);
+    scalar_value.add_fields()->set_string_data(FLAGS_scalar_filter_value2);
+    (*scalar_data)[FLAGS_scalar_filter_key2] = scalar_value;
+
+    request.set_use_scalar_filter(true);
+
+    DINGO_LOG(INFO) << "scalar_filter_key2: " << FLAGS_scalar_filter_key2
+                    << " scalar_filter_value2: " << FLAGS_scalar_filter_value2;
+  }
+
   DINGO_LOG(INFO) << "VectorScanQuery response: " << response.DebugString();
 
   interaction->SendRequest("IndexService", "VectorScanQuery", request, response);
@@ -599,47 +975,26 @@ void SendVectorGetRegionMetrics(ServerInteractionPtr interaction, uint64_t regio
   DINGO_LOG(INFO) << "VectorGetRegionMetrics response: " << response.DebugString();
 }
 
-void SendVectorAdd(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t start_id,
-                   uint32_t count, uint32_t step_count) {
+int SendBatchVectorAdd(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension,
+                       std::vector<uint64_t> vector_ids, bool with_scalar, bool with_table) {
   dingodb::pb::index::VectorAddRequest request;
   dingodb::pb::index::VectorAddResponse response;
-
-  if (region_id == 0) {
-    DINGO_LOG(ERROR) << "region_id is 0";
-    return;
-  }
-
-  if (count == 0) {
-    DINGO_LOG(ERROR) << "count is 0";
-    return;
-  }
-
-  if (step_count == 0) {
-    DINGO_LOG(ERROR) << "step_count is 0, use count as step_count";
-    step_count = count;
-  }
-
-  if (dimension == 0) {
-    DINGO_LOG(ERROR) << "dimension is 0";
-    return;
-  }
 
   request.set_region_id(region_id);
 
   std::mt19937 rng;
   std::uniform_real_distribution<> distrib(0.0, 10.0);
 
-  int end_id = start_id + count;
-  for (int i = start_id; i < end_id; ++i) {
+  for (auto vector_id : vector_ids) {
     auto* vector_with_id = request.add_vectors();
-    vector_with_id->set_id(i);
+    vector_with_id->set_id(vector_id);
     vector_with_id->mutable_vector()->set_dimension(dimension);
     vector_with_id->mutable_vector()->set_value_type(::dingodb::pb::common::ValueType::FLOAT);
     for (int j = 0; j < dimension; j++) {
       vector_with_id->mutable_vector()->add_float_values(distrib(rng));
     }
 
-    if (FLAGS_with_scalar) {
+    if (with_scalar) {
       for (int k = 0; k < 2; ++k) {
         auto* scalar_data = vector_with_id->mutable_scalar_data()->mutable_scalar_data();
         dingodb::pb::common::ScalarValue scalar_value;
@@ -656,35 +1011,123 @@ void SendVectorAdd(ServerInteractionPtr interaction, uint64_t region_id, uint32_
       }
     }
 
-    if (FLAGS_with_table) {
+    if (with_table) {
       auto* table_data = vector_with_id->mutable_table_data();
-      table_data->set_table_key(fmt::format("table_key{}", i));
-      table_data->set_table_value(fmt::format("table_value{}", i));
+      table_data->set_table_key(fmt::format("table_key{}", vector_id));
+      table_data->set_table_value(fmt::format("table_value{}", vector_id));
     }
+  }
 
-    if ((i - start_id + 1) % step_count == 0 || (i + 1) == end_id) {
-      DINGO_LOG(INFO) << "VectorAdd request";
-      butil::Status status = interaction->SendRequest("IndexService", "VectorAdd", request, response);
-      int success_count = 0;
-      for (auto key_state : response.key_states()) {
-        if (key_state) {
-          ++success_count;
-        }
-      }
-
-      if (response.has_error() && response.error().errcode() != dingodb::pb::error::Errno::OK) {
-        DINGO_LOG(ERROR) << "VectorAdd repsonse error: " << response.error().DebugString();
-      }
-
-      DINGO_LOG(INFO) << fmt::format(
-          "VectorAdd response success count: {} fail count: {} vector count: {} schedule: {}/{}", success_count,
-          response.key_states().size() - success_count, request.vectors().size(), i - start_id + 1, count);
-      request.clear_vectors();
+  butil::Status status = interaction->SendRequest("IndexService", "VectorAdd", request, response);
+  int success_count = 0;
+  for (auto key_state : response.key_states()) {
+    if (key_state) {
+      ++success_count;
     }
+  }
+
+  if (response.has_error() && response.error().errcode() != dingodb::pb::error::Errno::OK) {
+    DINGO_LOG(ERROR) << "VectorAdd repsonse error: " << response.error().DebugString();
+  }
+
+  DINGO_LOG(INFO) << fmt::format("VectorAdd response success region: {} count: {} fail count: {} vector count: {}",
+                                 region_id, success_count, response.key_states().size() - success_count,
+                                 request.vectors().size());
+
+  return response.error().errcode();
+}
+
+uint64_t DecodeVectorId(const std::string& value) {
+  dingodb::Buf buf(value);
+  if (value.size() == 17) {
+    buf.Skip(9);
+  } else if (value.size() == 16) {
+    buf.Skip(8);
+  } else {
+    DINGO_LOG(ERROR) << "Decode vector id failed, value size is not 16 or 17, value:["
+                     << dingodb::Helper::StringToHex(value) << "]";
+    return 0;
+  }
+
+  return buf.ReadLong();
+}
+
+bool QueryRegionIdByVectorId(dingodb::pb::meta::IndexRange& index_range, uint64_t vector_id,  // NOLINT
+                             uint64_t& region_id) {                                           // NOLINT
+  for (const auto& item : index_range.range_distribution()) {
+    const auto& range = item.range();
+    uint64_t min_vector_id = DecodeVectorId(range.start_key());
+    uint64_t max_vector_id = DecodeVectorId(range.end_key());
+    max_vector_id = max_vector_id == 0 ? UINT64_MAX : max_vector_id;
+    if (vector_id >= min_vector_id && vector_id < max_vector_id) {
+      region_id = item.id().entity_id();
+      return true;
+    }
+  }
+
+  DINGO_LOG(ERROR) << fmt::format("query region id by key failed, vector_id {}", vector_id);
+  return false;
+}
+
+void PrintIndexRange(dingodb::pb::meta::IndexRange& index_range) {  // NOLINT
+  DINGO_LOG(INFO) << "refresh route...";
+  for (const auto& item : index_range.range_distribution()) {
+    DINGO_LOG(INFO) << fmt::format("region {} range [{}-{})", item.id().entity_id(),
+                                   dingodb::Helper::StringToHex(item.range().start_key()),
+                                   dingodb::Helper::StringToHex(item.range().end_key()));
   }
 }
 
-void SendVectorDelete(ServerInteractionPtr interaction, uint64_t region_id, uint32_t start_id, uint32_t count) {
+void SendVectorAddRetry(std::shared_ptr<Context> ctx) {  // NOLINT
+  auto index_range = SendGetIndexRange(ctx->coordinator_interaction, ctx->table_id);
+  PrintIndexRange(index_range);
+
+  int end_id = ctx->start_id + ctx->count;
+  std::vector<uint64_t> vector_ids;
+  vector_ids.reserve(ctx->step_count);
+  for (int i = ctx->start_id; i < end_id; i += ctx->step_count) {
+    for (int j = i; j < i + ctx->step_count; ++j) {
+      vector_ids.push_back(j);
+    }
+
+    uint64_t region_id = 0;
+    if (!QueryRegionIdByVectorId(index_range, i, region_id)) {
+      DINGO_LOG(ERROR) << fmt::format("query region id by vector id failed, vector id {}", i);
+      return;
+    }
+
+    int ret = SendBatchVectorAdd(ctx->store_interaction, region_id, ctx->dimension, vector_ids, FLAGS_with_scalar,
+                                 FLAGS_with_table);
+    if (ret == dingodb::pb::error::EKEY_OUT_OF_RANGE || ret == dingodb::pb::error::EREGION_REDIRECT) {
+      bthread_usleep(1000 * 500);  // 500ms
+      index_range = SendGetIndexRange(ctx->coordinator_interaction, ctx->table_id);
+      PrintIndexRange(index_range);
+    }
+
+    DINGO_LOG(INFO) << fmt::format("schedule: {}/{}", i, end_id);
+
+    vector_ids.clear();
+  }
+}
+
+void SendVectorAdd(std::shared_ptr<Context> ctx) {  // NOLINT
+  int end_id = ctx->start_id + ctx->count;
+  std::vector<uint64_t> vector_ids;
+  vector_ids.reserve(ctx->step_count);
+  for (int i = ctx->start_id; i < end_id; i += ctx->step_count) {
+    for (int j = i; j < i + ctx->step_count; ++j) {
+      vector_ids.push_back(j);
+    }
+
+    int ret = SendBatchVectorAdd(ctx->store_interaction, ctx->region_id, ctx->dimension, vector_ids, FLAGS_with_scalar,
+                                 FLAGS_with_table);
+
+    vector_ids.clear();
+  }
+}
+
+void SendVectorDelete(ServerInteractionPtr interaction, uint64_t region_id, uint32_t start_id,  // NOLINT
+                      uint32_t count) {                                                         // NOLINT
   dingodb::pb::index::VectorDeleteRequest request;
   dingodb::pb::index::VectorDeleteResponse response;
 
@@ -706,7 +1149,7 @@ void SendVectorDelete(ServerInteractionPtr interaction, uint64_t region_id, uint
                                  response.key_states().size() - success_count);
 }
 
-void SendVectorGetMaxId(ServerInteractionPtr interaction, uint64_t region_id) {
+void SendVectorGetMaxId(ServerInteractionPtr interaction, uint64_t region_id) {  // NOLINT
   dingodb::pb::index::VectorGetBorderIdRequest request;
   dingodb::pb::index::VectorGetBorderIdResponse response;
 
@@ -717,7 +1160,7 @@ void SendVectorGetMaxId(ServerInteractionPtr interaction, uint64_t region_id) {
   DINGO_LOG(INFO) << "VectorGetBorderId response: " << response.DebugString();
 }
 
-void SendVectorGetMinId(ServerInteractionPtr interaction, uint64_t region_id) {
+void SendVectorGetMinId(ServerInteractionPtr interaction, uint64_t region_id) {  // NOLINT
   dingodb::pb::index::VectorGetBorderIdRequest request;
   dingodb::pb::index::VectorGetBorderIdResponse response;
 
@@ -870,6 +1313,166 @@ void SendVectorAddBatch(ServerInteractionPtr interaction, uint64_t region_id, ui
   out.close();
 }
 
+void SendVectorAddBatchDebug(ServerInteractionPtr interaction, uint64_t region_id, uint32_t dimension, uint32_t count,
+                             uint32_t step_count, int64_t start_id, const std::string& file) {
+  if (step_count == 0) {
+    DINGO_LOG(ERROR) << "step_count must be greater than 0";
+    return;
+  }
+  if (region_id == 0) {
+    DINGO_LOG(ERROR) << "region_id must be greater than 0";
+    return;
+  }
+  if (dimension == 0) {
+    DINGO_LOG(ERROR) << "dimension must be greater than 0";
+    return;
+  }
+  if (count == 0) {
+    DINGO_LOG(ERROR) << "count must be greater than 0";
+    return;
+  }
+  if (start_id < 0) {
+    DINGO_LOG(ERROR) << "start_id must be greater than 0";
+    return;
+  }
+  if (file.empty()) {
+    DINGO_LOG(ERROR) << "vector_index_add_cost_file must not be empty";
+    return;
+  }
+
+  std::filesystem::path url(file);
+  std::fstream out;
+  if (!std::filesystem::exists(url)) {
+    // not exist
+    out.open(file, std::ios::out | std::ios::binary);
+  } else {
+    out.open(file, std::ios::out | std::ios::binary | std::ios::trunc);
+  }
+
+  if (!out.is_open()) {
+    DINGO_LOG(ERROR) << fmt::format("{} open failed", file);
+    out.close();
+    return;
+  }
+
+  out << "index,cost(us)\n";
+  int64_t total = 0;
+
+  if (count % step_count != 0) {
+    DINGO_LOG(ERROR) << fmt::format("count {} must be divisible by step_count {}", count, step_count);
+    return;
+  }
+
+  uint32_t cnt = count / step_count;
+
+  std::mt19937 rng;
+  std::uniform_real_distribution<> distrib(0.0, 10.0);
+
+  std::vector<float> random_seeds;
+  random_seeds.resize(count * dimension);
+  for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t j = 0; j < dimension; ++j) {
+      random_seeds[i * dimension + j] = distrib(rng);
+    }
+
+    if (i % 10000 == 0) {
+      DINGO_LOG(INFO) << fmt::format("generate random seeds: {}/{}", i, count);
+    }
+  }
+
+  // Add data to index
+  // uint32_t num_threads = std::thread::hardware_concurrency();
+  // try {
+  //   ParallelFor(0, count, num_threads, [&](size_t row, size_t /*thread_id*/) {
+  //     std::mt19937 rng;
+  //     std::uniform_real_distribution<> distrib(0.0, 10.0);
+  //     for (uint32_t i = 0; i < dimension; ++i) {
+  //       random_seeds[row * dimension + i] = distrib(rng);
+  //     }
+  //   });
+  // } catch (std::runtime_error& e) {
+  //   DINGO_LOG(ERROR) << "generate random data failed, error=" << e.what();
+  //   return;
+  // }
+
+  DINGO_LOG(INFO) << fmt::format("generate random seeds: {}/{}", count, count);
+
+  for (uint32_t x = 0; x < cnt; x++) {
+    auto start = std::chrono::steady_clock::now();
+    {
+      dingodb::pb::index::VectorAddRequest request;
+      dingodb::pb::index::VectorAddResponse response;
+
+      request.set_region_id(region_id);
+
+      uint64_t real_start_id = start_id + x * step_count;
+      for (int i = real_start_id; i < real_start_id + step_count; ++i) {
+        auto* vector_with_id = request.add_vectors();
+        vector_with_id->set_id(i);
+        vector_with_id->mutable_vector()->set_dimension(dimension);
+        vector_with_id->mutable_vector()->set_value_type(::dingodb::pb::common::ValueType::FLOAT);
+        for (int j = 0; j < dimension; j++) {
+          vector_with_id->mutable_vector()->add_float_values(random_seeds[(i - start_id) * dimension + j]);
+        }
+
+        if (FLAGS_with_scalar) {
+          auto index = (i - start_id);
+          auto left = index % 200;
+
+          auto lambda_insert_scalar_data_function = [&vector_with_id](int tag) {
+            ::dingodb::pb::common::ScalarValue scalar_value;
+
+            scalar_value.set_field_type(::dingodb::pb::common::ScalarFieldType::STRING);
+            ::dingodb::pb::common::ScalarField* field = scalar_value.add_fields();
+            field->set_string_data("tag" + std::to_string(tag));
+
+            vector_with_id->mutable_scalar_data()->mutable_scalar_data()->insert(
+                {"tag" + std::to_string(tag), scalar_value});
+          };
+
+          if (left >= 0 && left < 99) {  // tag1 [0, 99] total 100
+            lambda_insert_scalar_data_function(1);
+          } else if (left >= 100 && left <= 139) {  // tag2 [100, 139]  total 40
+            lambda_insert_scalar_data_function(2);
+          } else if (left >= 140 && left <= 149) {  // tag3 [140, 149]  total 10
+            lambda_insert_scalar_data_function(3);
+          } else if (left >= 150 && left <= 154) {  // tag4 [150, 154]  total 5
+            lambda_insert_scalar_data_function(4);
+          } else if (left >= 155 && left <= 156) {  // tag5 [155, 156]  total 2
+            lambda_insert_scalar_data_function(5);
+          } else if (left >= 157 && left <= 157) {  // tag6 [157, 157]  total 1
+            lambda_insert_scalar_data_function(6);
+          } else {
+            // do nothing
+          }
+        }
+      }
+
+      butil::Status status = interaction->SendRequest("IndexService", "VectorAdd", request, response);
+      int success_count = 0;
+      for (auto key_state : response.key_states()) {
+        if (key_state) {
+          ++success_count;
+        }
+      }
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    auto diff = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    out << x << " , " << diff << "\n";
+
+    DINGO_LOG(INFO) << "index : " << x << " : " << diff << " us, avg : " << static_cast<long double>(diff) / step_count
+                    << " us";
+
+    total += diff;
+  }
+
+  DINGO_LOG(INFO) << fmt::format("total : {} cost : {} (us) avg : {} us", count, total,
+                                 static_cast<long double>(total) / count);
+
+  out.close();
+}
+
 void SendVectorCalcDistance(ServerInteractionPtr interaction, [[maybe_unused]] uint64_t region_id, uint32_t dimension,
                             const std::string& alg_type, const std::string& metric_type, int32_t left_vector_size,
                             int32_t right_vector_size, bool is_return_normlize) {
@@ -993,7 +1596,7 @@ void SendKvBatchGet(ServerInteractionPtr interaction, uint64_t region_id, const 
   interaction->SendRequest("StoreService", "KvBatchGet", request, response);
 }
 
-void SendKvPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& key, std::string value) {
+int SendKvPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& key, std::string value) {
   dingodb::pb::store::KvPutRequest request;
   dingodb::pb::store::KvPutResponse response;
 
@@ -1003,6 +1606,7 @@ void SendKvPut(ServerInteractionPtr interaction, uint64_t region_id, const std::
   kv->set_value(value.empty() ? Helper::GenRandomString(64) : value);
 
   interaction->SendRequest("StoreService", "KvPut", request, response);
+  return response.error().errcode();
 }
 
 void SendKvBatchPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& prefix, int count) {
@@ -1249,25 +1853,6 @@ void SendTransferLeaderByCoordinator(ServerInteractionPtr interaction, uint64_t 
   interaction->SendRequest("CoordinatorService", "TransferLeaderRegion", request, response);
 }
 
-std::vector<uint64_t> SendGetTablesBySchema(ServerInteractionPtr interaction) {
-  dingodb::pb::meta::GetTablesBySchemaRequest request;
-  dingodb::pb::meta::GetTablesBySchemaResponse response;
-
-  auto* schema_id = request.mutable_schema_id();
-  schema_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_SCHEMA);
-  schema_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::ROOT_SCHEMA);
-  schema_id->set_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
-
-  interaction->SendRequest("MetaService", "GetTablesBySchema", request, response);
-
-  std::vector<uint64_t> table_ids;
-  for (const auto& id : response.table_definition_with_ids()) {
-    table_ids.push_back(id.table_id().entity_id());
-  }
-
-  return table_ids;
-}
-
 struct BatchPutGetParam {
   uint64_t region_id;
   int32_t req_num;
@@ -1278,47 +1863,94 @@ struct BatchPutGetParam {
   std::map<std::string, std::shared_ptr<dingodb::pb::store::StoreService_Stub>> stubs;
 };
 
-void BatchPut(ServerInteractionPtr interaction, uint64_t region_id, const std::string& prefix, int req_num) {
+void BatchPut(std::shared_ptr<Context> ctx) {
   std::vector<uint64_t> latencys;
-  for (int i = 0; i < req_num; ++i) {
-    std::string key = prefix + Helper::GenRandomStringV2(32);
+  for (int i = 0; i < ctx->req_num; ++i) {
+    std::string key = ctx->prefix + Helper::GenRandomStringV2(32);
     std::string value = Helper::GenRandomString(256);
-    SendKvPut(interaction, region_id, key, value);
-    latencys.push_back(interaction->GetLatency());
+    SendKvPut(ctx->store_interaction, ctx->region_id, key, value);
+    latencys.push_back(ctx->store_interaction->GetLatency());
   }
 
   int64_t sum = std::accumulate(latencys.begin(), latencys.end(), static_cast<uint64_t>(0));
   DINGO_LOG(INFO) << "Put average latency: " << sum / latencys.size() << " us";
 }
 
-void TestBatchPut(ServerInteractionPtr interaction, uint64_t region_id, int thread_num, int req_num,
-                  const std::string& prefix) {
+bool QueryRegionIdByKey(dingodb::pb::meta::TableRange& table_range, const std::string& key, uint64_t& region_id) {
+  for (const auto& item : table_range.range_distribution()) {
+    const auto& range = item.range();
+    if (key >= range.start_key() && key < range.end_key()) {
+      region_id = item.id().entity_id();
+      return true;
+    }
+  }
+
+  DINGO_LOG(ERROR) << fmt::format("query region id by key failed, key {}", dingodb::Helper::StringToHex(key));
+
+  return false;
+}
+
+void PrintTableRange(dingodb::pb::meta::TableRange& table_range) {
+  DINGO_LOG(INFO) << "refresh route...";
+  for (const auto& item : table_range.range_distribution()) {
+    DINGO_LOG(INFO) << fmt::format("region {} range [{}-{})", item.id().entity_id(),
+                                   dingodb::Helper::StringToHex(item.range().start_key()),
+                                   dingodb::Helper::StringToHex(item.range().end_key()));
+  }
+}
+
+void BatchPutTable(std::shared_ptr<Context> ctx) {
+  auto table_range = SendGetTableRange(ctx->coordinator_interaction, ctx->table_id);
+  PrintTableRange(table_range);
+
+  std::vector<uint64_t> latencys;
+  for (int i = 0; i < ctx->req_num; ++i) {
+    std::string key = ctx->prefix + Helper::GenRandomStringV2(32);
+    std::string value = Helper::GenRandomString(256);
+
+    uint64_t region_id = 0;
+    if (!QueryRegionIdByKey(table_range, key, region_id)) {
+      break;
+    }
+
+    int ret = SendKvPut(ctx->store_interaction, region_id, key, value);
+    if (ret == dingodb::pb::error::EKEY_OUT_OF_RANGE || ret == dingodb::pb::error::EREGION_REDIRECT) {
+      bthread_usleep(1000 * 500);  // 500ms
+      table_range = SendGetTableRange(ctx->coordinator_interaction, ctx->table_id);
+      PrintTableRange(table_range);
+    }
+
+    latencys.push_back(ctx->store_interaction->GetLatency());
+  }
+}
+
+void TestBatchPut(std::shared_ptr<Context> ctx) {
   std::vector<bthread_t> tids;
-  tids.resize(thread_num);
-  for (int i = 0; i < thread_num; ++i) {
-    BatchPutGetParam* param = new BatchPutGetParam;
-    param->req_num = req_num;
-    param->region_id = region_id;
-    param->thread_no = i;
-    param->interaction = interaction;
-    param->prefix = prefix;
+  tids.resize(ctx->thread_num);
+  for (int i = 0; i < ctx->thread_num; ++i) {
+    auto copy_ctx = ctx->Clone();
+    copy_ctx->thread_no = i;
 
     if (bthread_start_background(
             &tids[i], nullptr,
             [](void* arg) -> void* {
-              std::unique_ptr<BatchPutGetParam> param(static_cast<BatchPutGetParam*>(arg));
+              std::shared_ptr<Context> ctx(static_cast<Context*>(arg));
 
-              LOG(INFO) << "========thread: " << param->thread_no;
-              BatchPut(param->interaction, param->region_id, param->prefix, param->req_num);
+              LOG(INFO) << "========thread: " << ctx->thread_no;
+              if (ctx->table_id > 0) {
+                BatchPutTable(ctx);
+              } else {
+                BatchPut(ctx);
+              }
               return nullptr;
             },
-            param) != 0) {
+            copy_ctx.release()) != 0) {
       DINGO_LOG(ERROR) << "Fail to create bthread";
       continue;
     }
   }
 
-  for (int i = 0; i < thread_num; ++i) {
+  for (int i = 0; i < ctx->thread_num; ++i) {
     bthread_join(tids[i], nullptr);
   }
 }
@@ -1507,11 +2139,12 @@ void TestRegionLifecycle(ServerInteractionPtr interaction, uint64_t region_id, c
   }
 }
 
-void TestDeleteRangeWhenTransferLeader(std::shared_ptr<Context> ctx, uint64_t region_id, int req_num,
+void TestDeleteRangeWhenTransferLeader(std::shared_ptr<Context> ctx, uint64_t region_id,
+                                       int req_num,  // NOLINT (*unused)
                                        const std::string& prefix) {
   // put data
   DINGO_LOG(INFO) << "batch put...";
-  BatchPut(ctx->store_interaction, region_id, prefix, req_num);
+  // BatchPut(ctx->store_interaction, region_id, prefix, req_num);
 
   // transfer leader
   dingodb::pb::common::Peer new_leader_peer;
@@ -1533,91 +2166,6 @@ void TestDeleteRangeWhenTransferLeader(std::shared_ptr<Context> ctx, uint64_t re
   // scan data
   DINGO_LOG(INFO) << "scan...";
   SendKvScan(ctx->store_interaction, region_id, prefix);
-}
-
-dingodb::pb::meta::CreateTableRequest BuildCreateTableRequest(const std::string& table_name, int partition_num) {
-  dingodb::pb::meta::CreateTableRequest request;
-
-  auto* schema_id = request.mutable_schema_id();
-  schema_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_SCHEMA);
-  schema_id->set_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
-  schema_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::ROOT_SCHEMA);
-
-  // string name = 1;
-  auto* table_definition = request.mutable_table_definition();
-  table_definition->set_name(table_name);
-
-  // repeated ColumnDefinition columns = 2;
-  for (int i = 0; i < 3; i++) {
-    auto* column = table_definition->add_columns();
-    std::string column_name("test_columen_");
-    column_name.append(std::to_string(i));
-    column->set_name(column_name);
-    column->set_sql_type("INT");
-    column->set_element_type("INT");
-    column->set_precision(100);
-    column->set_nullable(false);
-    column->set_indexofkey(7);
-    column->set_has_default_val(false);
-    column->set_default_val("0");
-  }
-
-  table_definition->set_version(1);
-  table_definition->set_ttl(0);
-  table_definition->set_engine(::dingodb::pb::common::Engine::ENG_ROCKSDB);
-  auto* prop = table_definition->mutable_properties();
-  (*prop)["test property"] = "test_property_value";
-
-  auto* partition_rule = table_definition->mutable_table_partition();
-  auto* part_column = partition_rule->add_columns();
-  part_column->assign("test_part_column");
-  auto* range_partition = partition_rule->mutable_range_partition();
-
-  for (int i = 0; i < partition_num; i++) {
-    auto* part_range = range_partition->add_ranges();
-    auto* part_range_start = part_range->mutable_start_key();
-    part_range_start->assign(std::to_string(i * 100));
-    auto* part_range_end = part_range->mutable_end_key();
-    part_range_end->assign(std::to_string((i + 1) * 100));
-  }
-
-  return request;
-}
-
-uint64_t SendCreateTable(ServerInteractionPtr interaction, const std::string& table_name, int partition_num) {
-  auto request = BuildCreateTableRequest(table_name, partition_num);
-
-  dingodb::pb::meta::CreateTableResponse response;
-  interaction->SendRequest("MetaService", "CreateTable", request, response);
-
-  DINGO_LOG(INFO) << "response=" << response.DebugString();
-  return response.table_id().entity_id();
-}
-
-dingodb::pb::meta::TableRange SendGetTableRange(ServerInteractionPtr interaction, uint64_t table_id) {
-  dingodb::pb::meta::GetTableRangeRequest request;
-  dingodb::pb::meta::GetTableRangeResponse response;
-
-  auto* mut_table_id = request.mutable_table_id();
-  mut_table_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_TABLE);
-  mut_table_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
-  mut_table_id->set_entity_id(table_id);
-
-  interaction->SendRequest("MetaService", "GetTableRange", request, response);
-
-  return response.table_range();
-}
-
-void SendDropTable(ServerInteractionPtr interaction, uint64_t table_id) {
-  dingodb::pb::meta::DropTableRequest request;
-  dingodb::pb::meta::DropTableResponse response;
-
-  auto* mut_table_id = request.mutable_table_id();
-  mut_table_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_TABLE);
-  mut_table_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
-  mut_table_id->set_entity_id(table_id);
-
-  interaction->SendRequest("MetaService", "DropTable", request, response);
 }
 
 // Create table / Put data / Get data / Destroy table
@@ -1648,22 +2196,6 @@ void* CreateAndPutAndGetAndDestroyTableRoutine(void* arg) {
   SendDropTable(ctx->coordinator_interaction, table_id);
 
   return nullptr;
-}
-
-uint64_t SendGetTableByName(ServerInteractionPtr interaction, const std::string& table_name) {
-  dingodb::pb::meta::GetTableByNameRequest request;
-  dingodb::pb::meta::GetTableByNameResponse response;
-
-  auto* schema_id = request.mutable_schema_id();
-  schema_id->set_entity_type(::dingodb::pb::meta::EntityType::ENTITY_TYPE_SCHEMA);
-  schema_id->set_entity_id(::dingodb::pb::meta::ReservedSchemaIds::DINGO_SCHEMA);
-  schema_id->set_parent_entity_id(::dingodb::pb::meta::ReservedSchemaIds::ROOT_SCHEMA);
-
-  request.set_table_name(table_name);
-
-  interaction->SendRequest("MetaService", "GetTableByName", request, response);
-
-  return response.table_definition_with_id().table_id().entity_id();
 }
 
 dingodb::pb::common::StoreMap SendGetStoreMap(ServerInteractionPtr interaction) {
@@ -1878,6 +2410,88 @@ void AutoDropTable(std::shared_ptr<Context> ctx) {
   for (int i = 0; i < ctx->req_num && i < table_ids.size(); ++i) {
     DINGO_LOG(INFO) << "Delete table: " << table_ids[i];
     SendDropTable(ctx->coordinator_interaction, table_ids[i]);
+  }
+}
+
+void CheckTableDistribution(std::shared_ptr<Context> ctx) {
+  auto table_range = SendGetTableRange(ctx->coordinator_interaction, ctx->table_id);
+
+  std::map<std::string, dingodb::pb::meta::RangeDistribution> region_map;
+  for (const auto& region_range : table_range.range_distribution()) {
+    if (region_range.range().start_key() >= region_range.range().end_key()) {
+      DINGO_LOG(ERROR) << fmt::format("Invalid region {} range [{}-{})", region_range.id().entity_id(),
+                                      dingodb::Helper::StringToHex(region_range.range().start_key()),
+                                      dingodb::Helper::StringToHex(region_range.range().end_key()));
+    }
+
+    auto it = region_map.find(region_range.range().start_key());
+    if (it == region_map.end()) {
+      region_map[region_range.range().start_key()] = region_range;
+    } else {
+      auto& tmp_region_range = it->second;
+      DINGO_LOG(ERROR) << fmt::format(
+          "Already exist region {} [{}-{}) curr region {} [{}-{})", tmp_region_range.id().entity_id(),
+          dingodb::Helper::StringToHex(tmp_region_range.range().start_key()),
+          dingodb::Helper::StringToHex(tmp_region_range.range().end_key()), region_range.id().entity_id(),
+          dingodb::Helper::StringToHex(region_range.range().start_key()),
+          dingodb::Helper::StringToHex(region_range.range().end_key()));
+    }
+  }
+
+  std::string key;
+  for (auto& [_, region_range] : region_map) {
+    DINGO_LOG(INFO) << fmt::format("region {} range [{}-{})", region_range.id().entity_id(),
+                                   dingodb::Helper::StringToHex(region_range.range().start_key()),
+                                   dingodb::Helper::StringToHex(region_range.range().end_key()));
+    if (!key.empty()) {
+      if (key != region_range.range().start_key()) {
+        DINGO_LOG(ERROR) << fmt::format("not continuous range, region {} [{}-{})", region_range.id().entity_id(),
+                                        dingodb::Helper::StringToHex(region_range.range().start_key()),
+                                        dingodb::Helper::StringToHex(region_range.range().end_key()));
+      }
+    }
+    key = region_range.range().end_key();
+  }
+}
+
+void CheckIndexDistribution(std::shared_ptr<Context> ctx) {
+  auto index_range = SendGetIndexRange(ctx->coordinator_interaction, ctx->table_id);
+
+  std::map<std::string, dingodb::pb::meta::RangeDistribution> region_map;
+  for (const auto& region_range : index_range.range_distribution()) {
+    if (region_range.range().start_key() >= region_range.range().end_key()) {
+      DINGO_LOG(ERROR) << fmt::format("Invalid region {} range [{}-{})", region_range.id().entity_id(),
+                                      dingodb::Helper::StringToHex(region_range.range().start_key()),
+                                      dingodb::Helper::StringToHex(region_range.range().end_key()));
+    }
+
+    auto it = region_map.find(region_range.range().start_key());
+    if (it == region_map.end()) {
+      region_map[region_range.range().start_key()] = region_range;
+    } else {
+      auto& tmp_region_range = it->second;
+      DINGO_LOG(ERROR) << fmt::format(
+          "Already exist region {} [{}-{}) curr region {} [{}-{})", tmp_region_range.id().entity_id(),
+          dingodb::Helper::StringToHex(tmp_region_range.range().start_key()),
+          dingodb::Helper::StringToHex(tmp_region_range.range().end_key()), region_range.id().entity_id(),
+          dingodb::Helper::StringToHex(region_range.range().start_key()),
+          dingodb::Helper::StringToHex(region_range.range().end_key()));
+    }
+  }
+
+  std::string key;
+  for (auto& [_, region_range] : region_map) {
+    DINGO_LOG(INFO) << fmt::format("region {} range [{}-{})", region_range.id().entity_id(),
+                                   dingodb::Helper::StringToHex(region_range.range().start_key()),
+                                   dingodb::Helper::StringToHex(region_range.range().end_key()));
+    if (!key.empty()) {
+      if (key != region_range.range().start_key()) {
+        DINGO_LOG(ERROR) << fmt::format("not continuous range, region {} [{}-{})", region_range.id().entity_id(),
+                                        dingodb::Helper::StringToHex(region_range.range().start_key()),
+                                        dingodb::Helper::StringToHex(region_range.range().end_key()));
+      }
+    }
+    key = region_range.range().end_key();
   }
 }
 
