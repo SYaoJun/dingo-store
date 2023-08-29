@@ -28,6 +28,9 @@ class Constant {
   // Define Global Region Id for auto increment
   static const uint64_t kAutoIncrementRegionId = 1;
 
+  // Define Global Region Id for tso
+  static const uint64_t kTsoRegionId = 2;
+
   // Define Global TableID for Coordinator(As only one)
   static const uint64_t kCoordinatorTableId = 0;
 
@@ -90,8 +93,9 @@ class Constant {
   inline static const std::string kStoreScanMaxFetchCntByServer = "max_fetch_cnt_by_server";
   inline static const std::string kStoreScanScanIntervalMs = "scan_interval_ms";
 
-  inline static const std::string kMetaRegionName = "COORDINATOR";
-  inline static const std::string kAutoIncrementRegionName = "AUTO_INCREMENT";
+  inline static const std::string kMetaRegionName = "0-COORDINATOR";
+  inline static const std::string kAutoIncrementRegionName = "1-AUTO_INCREMENT";
+  inline static const std::string kTsoRegionName = "2-TSO";
 
   // segment log
   static const uint32_t kSegmentLogDefaultMaxSegmentSize = 8 * 1024 * 1024;  // 8M
@@ -131,6 +135,9 @@ class Constant {
   // collect metrics
   static const uint32_t kApproximateSizeMetricsCollectIntervalS = 50;
   static const uint32_t kMetricsCollectIntervalS = 300;
+
+  // hnsw max elements amplification ratio
+  static constexpr float kHnswMaxElementsAmplificationRatio = 1.2;
 };
 
 }  // namespace dingodb

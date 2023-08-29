@@ -15,6 +15,7 @@
 #ifndef DINGODB_STORE_SERVER_H_
 #define DINGODB_STORE_SERVER_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -24,10 +25,12 @@
 #include "coordinator/auto_increment_control.h"
 #include "coordinator/coordinator_control.h"
 #include "coordinator/coordinator_interaction.h"
+#include "coordinator/tso_control.h"
 #include "crontab/crontab.h"
 #include "engine/raw_engine.h"
 #include "engine/storage.h"
 #include "log/log_storage_manager.h"
+#include "meta/meta_reader.h"
 #include "meta/store_meta_manager.h"
 #include "metrics/store_metrics_manager.h"
 #include "proto/common.pb.h"
@@ -112,6 +115,8 @@ class Server {
 
   butil::Status StartAutoIncrementRegion(const std::shared_ptr<Config>& config, std::shared_ptr<Engine>& kv_engine);
 
+  butil::Status StartTsoRegion(const std::shared_ptr<Config>& config, std::shared_ptr<Engine>& kv_engine);
+
   // Recover server state, include store/region/raft.
   bool Recover();
 
@@ -132,10 +137,23 @@ class Server {
   std::shared_ptr<Engine> GetEngine() { return engine_; }
   std::shared_ptr<RawEngine> GetRawEngine() { return raw_engine_; }
 
+  std::shared_ptr<RaftStoreEngine> GetRaftStoreEngine() {
+    auto engine = GetEngine();
+    if (engine->GetID() == pb::common::ENG_RAFT_STORE) {
+      return std::dynamic_pointer_cast<RaftStoreEngine>(engine);
+    }
+    return nullptr;
+  }
+
+  std::shared_ptr<MetaReader> GetMetaReader() { return meta_reader_; }
+  std::shared_ptr<MetaWriter> GetMetaWriter() { return meta_writer_; }
+
   std::shared_ptr<LogStorageManager> GetLogStorageManager() { return log_storage_; }
 
   std::shared_ptr<Storage> GetStorage() { return storage_; }
   std::shared_ptr<StoreMetaManager> GetStoreMetaManager() { return store_meta_manager_; }
+  store::RegionPtr GetRegion(uint64_t region_id);
+  std::vector<store::RegionPtr> GetAllAliveRegion();
   std::shared_ptr<StoreMetricsManager> GetStoreMetricsManager() { return store_metrics_manager_; }
   std::shared_ptr<CrontabManager> GetCrontabManager() { return crontab_manager_; }
 
@@ -144,6 +162,7 @@ class Server {
   std::shared_ptr<RegionCommandManager> GetRegionCommandManager() { return region_command_manager_; }
   std::shared_ptr<CoordinatorControl> GetCoordinatorControl() { return coordinator_control_; }
   std::shared_ptr<AutoIncrementControl>& GetAutoIncrementControlReference() { return auto_increment_control_; }
+  std::shared_ptr<TsoControl> GetTsoControl() { return tso_control_; }
 
   void SetEndpoints(const std::vector<butil::EndPoint> endpoints) { endpoints_ = endpoints; }
 
@@ -172,8 +191,6 @@ class Server {
     auto config = ConfigManager::GetInstance()->GetConfig(role_);
     return config == nullptr ? "" : config->GetString("vector.index_path");
   }
-
-  std::shared_ptr<VectorIndexManager> GetVectorIndexManager() { return vector_index_manager_; }
 
   std::shared_ptr<PreSplitChecker> GetPreSplitChecker() { return pre_split_checker_; }
 
@@ -213,6 +230,11 @@ class Server {
   std::shared_ptr<Engine> engine_;
   std::shared_ptr<RawEngine> raw_engine_;
 
+  // Meta reader
+  std::shared_ptr<MetaReader> meta_reader_;
+  // Meta writer
+  std::shared_ptr<MetaWriter> meta_writer_;
+
   // This is log storage manager
   std::shared_ptr<LogStorageManager> log_storage_;
 
@@ -237,14 +259,15 @@ class Server {
 
   // This is store and coordinator heartbeat.
   std::shared_ptr<Heartbeat> heartbeat_;
-  // This is manage auto increment meta data,
+  // This is manage auto increment meta data, of table auto increment.
   std::shared_ptr<AutoIncrementControl> auto_increment_control_;
+
+  // This is manage tso meta data, of timestamp oracle.
+  std::shared_ptr<TsoControl> tso_control_;
 
   // checkpoint directory
   std::string checkpoint_path_;
 
-  // vector index manager
-  std::shared_ptr<VectorIndexManager> vector_index_manager_;
   // Pre split checker
   std::shared_ptr<PreSplitChecker> pre_split_checker_;
 };

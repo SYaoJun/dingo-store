@@ -136,6 +136,9 @@ bool Server::InitRawEngine() {
     return false;
   }
 
+  meta_reader_ = std::make_shared<MetaReader>(raw_engine_);
+  meta_writer_ = std::make_shared<MetaWriter>(raw_engine_);
+
   return true;
 }
 
@@ -144,7 +147,7 @@ bool Server::InitEngine() {
 
   // cooridnator
   if (role_ == pb::common::ClusterRole::COORDINATOR) {
-    // init CoordinatorController
+    // 1.init CoordinatorController
     coordinator_control_ = std::make_shared<CoordinatorControl>(std::make_shared<MetaReader>(raw_engine_),
                                                                 std::make_shared<MetaWriter>(raw_engine_), raw_engine_);
 
@@ -163,6 +166,7 @@ bool Server::InitEngine() {
     // set raft_meta_engine to coordinator_control
     coordinator_control_->SetKvEngine(engine_);
 
+    // 2.init AutoIncrementController
     auto_increment_control_ = std::make_shared<AutoIncrementControl>();
     if (!auto_increment_control_->Recover()) {
       DINGO_LOG(ERROR) << "auto_increment_control_->Recover Failed";
@@ -172,6 +176,21 @@ bool Server::InitEngine() {
       DINGO_LOG(ERROR) << "auto_increment_control_->Init Failed";
       return false;
     }
+
+    // 3.init TsoController
+    tso_control_ = std::make_shared<TsoControl>();
+    if (!tso_control_->Recover()) {
+      DINGO_LOG(ERROR) << "tso_control_->Recover Failed";
+      return false;
+    }
+    if (!tso_control_->Init()) {
+      DINGO_LOG(ERROR) << "tso_control_->Init Failed";
+      return false;
+    }
+
+    // set raft_meta_engine to tso_control
+    tso_control_->SetKvEngine(engine_);
+
   } else {
     engine_ = std::make_shared<RaftStoreEngine>(raw_engine_);
     if (!engine_->Init(config)) {
@@ -183,8 +202,7 @@ bool Server::InitEngine() {
   return true;
 }
 
-butil::Status Server::StartMetaRegion(const std::shared_ptr<Config>& config,  // NOLINT
-                                      std::shared_ptr<Engine>& kv_engine) {   // NOLINT
+butil::Status Server::StartMetaRegion(const std::shared_ptr<Config>& config, std::shared_ptr<Engine>& kv_engine) {
   // std::shared_ptr<Context> ctx = std::make_shared<Context>();
   std::shared_ptr<pb::common::RegionDefinition> region =
       CreateCoordinatorRegion(config, Constant::kCoordinatorRegionId, Constant::kMetaRegionName /*, ctx*/);
@@ -201,6 +219,15 @@ butil::Status Server::StartAutoIncrementRegion(const std::shared_ptr<Config>& co
 
   auto raft_engine = std::dynamic_pointer_cast<RaftStoreEngine>(kv_engine);
   return raft_engine->AddNode(region, auto_increment_control_, true);
+}
+
+butil::Status Server::StartTsoRegion(const std::shared_ptr<Config>& config, std::shared_ptr<Engine>& kv_engine) {
+  // std::shared_ptr<Context> ctx = std::make_shared<Context>();
+  std::shared_ptr<pb::common::RegionDefinition> region =
+      CreateCoordinatorRegion(config, Constant::kTsoRegionId, Constant::kTsoRegionName /*, ctx*/);
+
+  auto raft_engine = std::dynamic_pointer_cast<RaftStoreEngine>(kv_engine);
+  return raft_engine->AddNode(region, tso_control_, true);
 }
 
 bool Server::InitCoordinatorInteraction() {
@@ -604,12 +631,7 @@ bool Server::InitStoreMetricsManager() {
   return store_metrics_manager_->Init();
 }
 
-bool Server::InitVectorIndexManager() {
-  vector_index_manager_ = std::make_shared<VectorIndexManager>(raw_engine_, std::make_shared<MetaReader>(raw_engine_),
-                                                               std::make_shared<MetaWriter>(raw_engine_));
-
-  return vector_index_manager_->Init(store_meta_manager_->GetStoreRegionMeta()->GetAllAliveRegion());
-}
+bool Server::InitVectorIndexManager() { return VectorIndexManager::Init(GetAllAliveRegion()); }
 
 bool Server::InitPreSplitChecker() {
   pre_split_checker_ = std::make_shared<PreSplitChecker>();
@@ -657,6 +679,28 @@ void Server::Destroy() {
   store_controller_->Destroy();
 
   google::ShutdownGoogleLogging();
+}
+
+store::RegionPtr Server::GetRegion(uint64_t region_id) {
+  if (store_meta_manager_ == nullptr) {
+    return nullptr;
+  }
+  auto store_region_meta = store_meta_manager_->GetStoreRegionMeta();
+  if (store_region_meta == nullptr) {
+    return nullptr;
+  }
+  return store_region_meta->GetRegion(region_id);
+}
+
+std::vector<store::RegionPtr> Server::GetAllAliveRegion() {
+  if (store_meta_manager_ == nullptr) {
+    return {};
+  }
+  auto store_region_meta = store_meta_manager_->GetStoreRegionMeta();
+  if (store_region_meta == nullptr) {
+    return {};
+  }
+  return store_region_meta->GetAllAliveRegion();
 }
 
 std::shared_ptr<pb::common::RegionDefinition> Server::CreateCoordinatorRegion(const std::shared_ptr<Config>& /*config*/,
